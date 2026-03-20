@@ -55,7 +55,7 @@ class CracklingStack(Stack):
             },
           
             # A Network Address Translator routes outbound traffic to the internet when necessary
-            nat_gateways=1,
+            nat_gateways=0,
         )
 
         ### Simple Storage Service (S3) is a object store that can host websites.
