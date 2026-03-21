@@ -44,7 +44,7 @@ class CracklingStack(Stack):
         # VPCs are used for constraining infrastructure to a private network.
         cracklingVpc = ec2_.Vpc(
             scope=self,
-            id="CracklingVpc",
+            id="N11596708-PR-21-CracklingStack-TEST",
             gateway_endpoints={
                 "s3" : ec2_.GatewayVpcEndpointOptions(
                     service=ec2_.GatewayVpcEndpointAwsService.S3
