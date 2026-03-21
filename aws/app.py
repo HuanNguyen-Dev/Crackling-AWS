@@ -1000,8 +1000,8 @@ class CracklingStack(Stack):
 
 
 app = cdk.App()
-
-CracklingStack(app, f"ProjectStack", synthesizer=DefaultStackSynthesizer(
+stack_name = app.node.try_get_context("name") or "CracklingStack"
+CracklingStack(app, stack_name, synthesizer=DefaultStackSynthesizer(
     #file_assets_bucket_name="a-public-facing-bucket-n10753753"
 ))
 
