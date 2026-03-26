@@ -1,5 +1,5 @@
 """
-Crackling-cloud AWS
+Crackling-Cloud in AWS
 
 Jacob Bradford (1), Timothy Chappell (1), Brendan Hosking (2), Laurence Wilson (2), Dimitri Perrin (1)
     (1) Queensland University of Technology, Brisbane, Australia 
@@ -39,6 +39,11 @@ availabilityZone = Aws.REGION
 class CracklingStack(Stack):
     def __init__(self, scope, id, **kwargs) -> None:
         super().__init__(scope, id, **kwargs)
+        
+        # Optional: Tag AWS resources with commit hash
+        commit_hash = self.node.try_get_context("gitCommit")
+        if commit_hash:
+            cdk.Tags.of(self).add("GitCommit", commit_hash[:8])
 
         ### Virtual Private Cloud
         # VPCs are used for constraining infrastructure to a private network.
@@ -306,8 +311,8 @@ class CracklingStack(Stack):
 
         ### An SQS Deal Letter queue handles messages that have "died" in another queue.
         # This is a dead letter queue for the queue that implements the genome portion/part downloader
-        sqsGenomePartDownloads = sqs_.Queue(
-            self, "DLQ",
+        sqsGenomePartsDlq = sqs_.Queue(
+            self, "sqsGenomePartsDlq",
             retention_period=Duration.days(14)
         )
 
@@ -318,7 +323,7 @@ class CracklingStack(Stack):
             retention_period=Duration.minutes(30),
             dead_letter_queue=sqs_.DeadLetterQueue(
                 max_receive_count=3,  # Set maxReceiveCount to 3
-                queue=sqsGenomePartDownloads
+                queue=sqsGenomePartsDlq
             )
         )
 
@@ -354,7 +359,7 @@ class CracklingStack(Stack):
         # This function creates a record in the DynamoDB jobs table.
         # MAX_SEQ_LENGTH defines the maximum length that the input genetic sequence can be.
         # Read/write permissions on the jobs table needs to be granted to this function.
-        lambdaCreateJob = lambda_.Function(self, "createJob", 
+        lambdaCreateJob = lambda_.Function(self, "lambdaCreateJob", 
             runtime=lambda_.Runtime.PYTHON_3_10,
             handler="lambda_function.lambda_handler",
             code=lambda_.Code.from_asset("../modules/createJob"),
@@ -371,7 +376,7 @@ class CracklingStack(Stack):
         ddbTaskTracking.grant_read_write_data(lambdaCreateJob)
 
         ### Lambda function that return presigned URL to allow users to upload custom dataset to s3 genome storage
-        lambdaCustomDataUpload = lambda_.Function(self, "CustomDataUpload", 
+        lambdaCustomDataUpload = lambda_.Function(self, "lambdaCustomDataUpload", 
             runtime=lambda_.Runtime.PYTHON_3_10,
             handler="lambda_function.lambda_handler",
             code=lambda_.Code.from_asset("../modules/customData"),
@@ -389,7 +394,7 @@ class CracklingStack(Stack):
         ### Lambda function that organises the parallel download of genome parts
         # Extracts names and sizes from fasta files in NCBI server
         # Split each file into part file portions
-        lambdaGenomeDownloadScheduler = lambda_.Function(self, "downloader", 
+        lambdaGenomeDownloadScheduler = lambda_.Function(self, "lambdaGenomeDownloadScheduler", 
             runtime=lambda_.Runtime.PYTHON_3_10,
             handler="lambda_function.lambda_handler",
             code=lambda_.Code.from_asset("../modules/genomeDownloadScheduler"),
@@ -425,7 +430,7 @@ class CracklingStack(Stack):
 
        
         ### Lambda function that downloads files from NCBI server and uploads them to S3 
-        lambdaGenomePartsDownloader = lambda_.Function(self, "partloader", 
+        lambdaGenomePartsDownloader = lambda_.Function(self, "lambdaGenomePartsDownloader", 
             runtime=lambda_.Runtime.PYTHON_3_10,
             handler="lambda_function.lambda_handler",
             code=lambda_.Code.from_asset("../modules/genomePartsDownloader"),
@@ -454,7 +459,7 @@ class CracklingStack(Stack):
         )
 
         # -> -> determines how many concurrent extractOfftarget functions will run and calls them all
-        lambdaDetermineConcurrentExtractions = lambda_.Function(self, "determineConcurrentExtractions", 
+        lambdaDetermineConcurrentExtractions = lambda_.Function(self, "lambdaDetermineConcurrentExtractions", 
             runtime=lambda_.Runtime.PYTHON_3_10,
             handler="lambda_function.lambda_handler",
             code=lambda_.Code.from_asset("../modules/determineConcurrentExtractions"),
@@ -484,7 +489,7 @@ class CracklingStack(Stack):
         lambdaDetermineConcurrentExtractions.add_to_role_policy(lambdaS3AccessPointIAM)
 
         # -> -> extractOfftargets
-        lambdaExtractOfftargets = lambda_.Function(self, "extractOfftargets", 
+        lambdaExtractOfftargets = lambda_.Function(self, "lambdaExtractOfftargets", 
             runtime=lambda_.Runtime.PYTHON_3_10,
             handler="lambda_function.lambda_handler",
             code=lambda_.Code.from_asset("../modules/extractOfftargets"),
@@ -514,7 +519,7 @@ class CracklingStack(Stack):
         lambdaExtractOfftargets.add_to_role_policy(lambdaS3AccessPointIAM)
 
         # Lambda that mergers all offtargets file into one for issl creation
-        lambdaOfftargetsMerger = lambda_.Function(self, "OfftargetsMerger", 
+        lambdaOfftargetsMerger = lambda_.Function(self, "lambdaOfftargetsMerger", 
             runtime=lambda_.Runtime.PYTHON_3_10,
             handler="lambda_function.lambda_handler",
             code=lambda_.Code.from_asset("../modules/OfftargetsMerger"),
@@ -542,7 +547,7 @@ class CracklingStack(Stack):
         lambdaOfftargetsMerger.add_to_role_policy(lambdaS3AccessPointIAM)
 
         # -> -> issl_creation
-        lambdaIsslCreation = lambda_.Function(self, "isslCreationLambda", 
+        lambdaIsslCreation = lambda_.Function(self, "lambdaIsslCreation", 
             runtime=lambda_.Runtime.PYTHON_3_10,
             handler="lambda_function.lambda_handler",
             code=lambda_.Code.from_asset("../modules/isslCreation"),
@@ -582,7 +587,7 @@ class CracklingStack(Stack):
         # It creates one record per guide in the DynamoDB guides table.
         # It needs permission to read/write data from the jobs and guides tables.
         # It needs permission to send messages to the SQS queues.
-        lambdaTargetScan = lambda_.Function(self, "targetScan", 
+        lambdaTargetScan = lambda_.Function(self, "lambdaTargetScan", 
             runtime=lambda_.Runtime.PYTHON_3_10,
             handler="lambda_function.lambda_handler",
             code=lambda_.Code.from_asset("../modules/targetScan"),
@@ -616,7 +621,7 @@ class CracklingStack(Stack):
         ### Lambda function to assess guide efficiency
         # This function consumes messages in the SQS consensus queue.
         # The results are written to the DynamoDB consensus table.
-        lambdaConsensus = lambda_.Function(self, "consensus", 
+        lambdaConsensus = lambda_.Function(self, "lambdaConsensus", 
             runtime=lambda_.Runtime.PYTHON_3_10,
             handler="lambda_function.lambda_handler",
             code=lambda_.Code.from_asset("../modules/consensus"),
@@ -653,7 +658,7 @@ class CracklingStack(Stack):
         ### Lambda function that assesses guide specificity using ISSL.
         # This function consumes messages in the SQS Issl queue.
         # The results are written to the DynamoDB consensus table.
-        lambdaIssl = lambda_.Function(self, "issl", 
+        lambdaIssl = lambda_.Function(self, "lambdaIssl", 
             runtime=lambda_.Runtime.PYTHON_3_10,
             handler="lambda_function.lambda_handler",
             code=lambda_.Code.from_asset("../modules/issl"),
