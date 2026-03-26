@@ -27,7 +27,7 @@ from aws_cdk import (
     aws_cloudfront as cloudfront_,
     aws_cloudfront_origins as origins_,
     custom_resources as cr,
-    Aws,
+    Aws,   
     DefaultStackSynthesizer
 )     
 
@@ -58,7 +58,10 @@ class CracklingStack(Stack):
                     service=ec2_.GatewayVpcEndpointAwsService.DYNAMODB
                 )
             },
-          
+            
+            # A Network Address Translator routes outbound traffic to the internet when necessary.
+            # Force the VPC to have no internet access. 
+            # The Lambda functions that interact with NCBI are placed *outside* of this VPC (e.g., `lambdaGenomePartsDownloader`).
             # A Network Address Translator routes outbound traffic to the internet when necessary
             nat_gateways=0,
         )
@@ -111,46 +114,36 @@ class CracklingStack(Stack):
             )]
         )
 
-        ### Delegate permisions to access point
-        s3GenomeAccessPointPolicy = iam_.PolicyStatement.from_json({
-            "Effect": "Allow",
-            "Principal": {
-                "AWS": "*"
-            },
-            "Action": "*",
-            "Resource": [
-               f"{s3Genome.bucket_arn}",
-                f"{s3Genome.bucket_arn}/*"
-            ],
-            "Condition": {
-                "StringEquals": {
-                    "s3:DataAccessPointAccount": account_number
-                }
-            }
-        })
-
-        s3Genome.add_to_resource_policy(s3GenomeAccessPointPolicy)
-        
         ### VPC access point for Genome storage
-        s3GenomeAccess = s3_.CfnAccessPoint(
-            scope=self,
+        s3GenomeAccess = s3_.CfnAccessPoint(self, "s3GenomeAccess",
             bucket=s3Genome.bucket_name,
-            id="s3GenomeAccess",
             vpc_configuration=s3_.CfnAccessPoint.VpcConfigurationProperty(
                 vpc_id=cracklingVpc.vpc_id
             )
         )
 
-        lambdaS3AccessPointIAM = iam_.PolicyStatement.from_json({
+        policyAccessS3GenomeBucket = iam_.PolicyStatement.from_json({
             "Effect": "Allow",
             "Action": [
-                "s3:*"
+                "s3:*", 
+                "s3:ListBucket"
             ],
             "Resource": [
                 f"{s3GenomeAccess.attr_arn}",
-                f"{s3GenomeAccess.attr_arn}/object/*"
+                f"{s3GenomeAccess.attr_arn}/object/*",
+                s3Genome.bucket_arn,
+                f"{s3Genome.bucket_arn}/*"
             ]
         })
+
+        ### VPC access to SQS
+        vpcSqsEndpoint = ec2_.InterfaceVpcEndpoint(
+            self, "vpcSqsEndpoint",
+            vpc=cracklingVpc,
+            service=ec2_.InterfaceVpcEndpointAwsService.SQS,
+            subnets=ec2_.SubnetSelection(subnet_type=ec2_.SubnetType.PRIVATE_ISOLATED),
+            private_dns_enabled=True
+        )
 
         ### DynamoDB (ddb) is a key-value store.
         # This table stores jobs for processing
@@ -383,13 +376,12 @@ class CracklingStack(Stack):
             layers=[lambdaLayerCommonFuncs],
             vpc=cracklingVpc,
             environment={
-                'BUCKET' : s3GenomeAccess.attr_arn,
+                'BUCKET' : s3GenomeAccess.attr_alias,
                 'BUCKET_NAME': s3Genome.bucket_name,
                 'REGION_NAME': availabilityZone
             }
         )
-        s3Genome.grant_read_write(lambdaCustomDataUpload)   
-        lambdaCustomDataUpload.add_to_role_policy(lambdaS3AccessPointIAM)
+        lambdaCustomDataUpload.add_to_role_policy(policyAccessS3GenomeBucket)
 
         ### Lambda function that organises the parallel download of genome parts
         # Extracts names and sizes from fasta files in NCBI server
@@ -399,12 +391,11 @@ class CracklingStack(Stack):
             handler="lambda_function.lambda_handler",
             code=lambda_.Code.from_asset("../modules/genomeDownloadScheduler"),
             layers=[lambdaLayerCommonFuncs,lambdaLayerNcbi,lambdaLayerLib],
-            vpc=cracklingVpc,
             timeout= duration,
             memory_size= 2065,
             ephemeral_storage_size = cdk.Size.gibibytes(10),
             environment={
-                'BUCKET' : s3GenomeAccess.attr_arn,
+                'BUCKET' : s3Genome.bucket_name,
                 'ISSL_QUEUE' : sqsDetermineConcurrentExtractions.queue_url,
                 'TARGET_SCAN_QUEUE' : sqsTargetScan.queue_url,
                 'FILE_PARTS_QUEUE' : sqsGenomeParts.queue_url,
@@ -424,9 +415,8 @@ class CracklingStack(Stack):
             event_source_arn=ddbJobs.table_stream_arn,
             retry_attempts=0,
             starting_position=lambda_.StartingPosition.LATEST
-        )
-        s3Genome.grant_read_write(lambdaGenomeDownloadScheduler)   
-        lambdaGenomeDownloadScheduler.add_to_role_policy(lambdaS3AccessPointIAM)
+        ) 
+        lambdaGenomeDownloadScheduler.add_to_role_policy(policyAccessS3GenomeBucket)
 
        
         ### Lambda function that downloads files from NCBI server and uploads them to S3 
@@ -435,13 +425,12 @@ class CracklingStack(Stack):
             handler="lambda_function.lambda_handler",
             code=lambda_.Code.from_asset("../modules/genomePartsDownloader"),
             layers=[lambdaLayerCommonFuncs, lambdaLayerRequests],
-            vpc=cracklingVpc,
             timeout= duration,
             memory_size= 10240,
             ephemeral_storage_size = cdk.Size.gibibytes(10), 
             environment={
                 'FILES_TABLE' : ddbGenomeParts.table_name,
-                'BUCKET' : s3GenomeAccess.attr_arn,
+                'BUCKET' : s3Genome.bucket_name,
                 'ISSL_QUEUE' : sqsDetermineConcurrentExtractions.queue_url
             }
         )
@@ -449,8 +438,6 @@ class CracklingStack(Stack):
         sqsGenomeParts.grant_consume_messages(lambdaGenomePartsDownloader)
         sqsDetermineConcurrentExtractions.grant_send_messages(lambdaGenomePartsDownloader)
         ddbGenomeParts.grant_read_write_data(lambdaGenomePartsDownloader)
-        s3Genome.grant_read_write(lambdaGenomePartsDownloader)
-        lambdaGenomePartsDownloader.add_to_role_policy(lambdaS3AccessPointIAM)
 
         lambdaGenomePartsDownloader.add_event_source_mapping(
             "mapppIsslCreation",
@@ -471,7 +458,7 @@ class CracklingStack(Stack):
             environment={
                 'QUEUE' : sqsExtractOfftargets.queue_url,
                 'DDB' : ddbOfftargets.table_name,
-                'BUCKET' : s3GenomeAccess.attr_arn,
+                'BUCKET' : s3GenomeAccess.attr_alias,
                 'LD_LIBRARY_PATH' : ld_library_path,
                 'PATH' : path
             }
@@ -486,7 +473,7 @@ class CracklingStack(Stack):
             event_source_arn=sqsDetermineConcurrentExtractions.queue_arn,
             batch_size=1
         )
-        lambdaDetermineConcurrentExtractions.add_to_role_policy(lambdaS3AccessPointIAM)
+        lambdaDetermineConcurrentExtractions.add_to_role_policy(policyAccessS3GenomeBucket)
 
         # -> -> extractOfftargets
         lambdaExtractOfftargets = lambda_.Function(self, "lambdaExtractOfftargets", 
@@ -501,13 +488,12 @@ class CracklingStack(Stack):
             environment={
                 'QUEUE' : sqsOfftargetsMerger.queue_url,
                 'DDB' : ddbOfftargets.table_name,
-                'BUCKET' : s3GenomeAccess.attr_arn,
+                'BUCKET' : s3GenomeAccess.attr_alias,
                 'LD_LIBRARY_PATH' : ld_library_path,
                 'PATH' : path
             }
         )
 
-        s3Genome.grant_read_write(lambdaExtractOfftargets)
         ddbOfftargets.grant_read_write_data(lambdaExtractOfftargets)
         sqsExtractOfftargets.grant_consume_messages(lambdaExtractOfftargets)
         sqsOfftargetsMerger.grant_send_messages(lambdaExtractOfftargets)
@@ -516,7 +502,7 @@ class CracklingStack(Stack):
             event_source_arn=sqsExtractOfftargets.queue_arn,
             batch_size=1
         )
-        lambdaExtractOfftargets.add_to_role_policy(lambdaS3AccessPointIAM)
+        lambdaExtractOfftargets.add_to_role_policy(policyAccessS3GenomeBucket)
 
         # Lambda that mergers all offtargets file into one for issl creation
         lambdaOfftargetsMerger = lambda_.Function(self, "lambdaOfftargetsMerger", 
@@ -530,7 +516,7 @@ class CracklingStack(Stack):
             ephemeral_storage_size = cdk.Size.gibibytes(10),
             environment={
                 'QUEUE' : sqsIsslCreation.queue_url,
-                'BUCKET' : s3GenomeAccess.attr_arn,
+                'BUCKET' : s3GenomeAccess.attr_alias,
                 'LD_LIBRARY_PATH' : ld_library_path,
                 'PATH' : path
             }
@@ -544,7 +530,7 @@ class CracklingStack(Stack):
             event_source_arn=sqsOfftargetsMerger.queue_arn,
             batch_size=1
         )
-        lambdaOfftargetsMerger.add_to_role_policy(lambdaS3AccessPointIAM)
+        lambdaOfftargetsMerger.add_to_role_policy(policyAccessS3GenomeBucket)
 
         # -> -> issl_creation
         lambdaIsslCreation = lambda_.Function(self, "lambdaIsslCreation", 
@@ -559,13 +545,12 @@ class CracklingStack(Stack):
             environment={
                 'QUEUE' : sqsTargetScan.queue_url,
                 'ISSL_QUEUE' : sqsIsslReinvoke.queue_url,
-                'BUCKET' : s3GenomeAccess.attr_arn,
+                'BUCKET' : s3GenomeAccess.attr_alias,
                 'LD_LIBRARY_PATH' : ld_library_path,
                 'PATH' : path
             }
         )
 
-        s3Genome.grant_read_write(lambdaIsslCreation)
         sqsIsslCreation.grant_consume_messages(lambdaIsslCreation)
         sqsIsslReinvoke.grant_consume_messages(lambdaIsslCreation)
         sqsIsslReinvoke.grant_send_messages(lambdaIsslCreation)
@@ -580,7 +565,7 @@ class CracklingStack(Stack):
             event_source_arn=sqsIsslReinvoke.queue_arn,
             batch_size=1
         )
-        lambdaIsslCreation.add_to_role_policy(lambdaS3AccessPointIAM)
+        lambdaIsslCreation.add_to_role_policy(policyAccessS3GenomeBucket)
         
         ### Lambda function that scans a sequence for CRISPR sites.
         # This function is triggered when a record is written to the DynamoDB jobs table.
@@ -635,13 +620,13 @@ class CracklingStack(Stack):
                 'TASK_TRACKING_TABLE' : ddbTaskTracking.table_name,
                 'JOBS_TABLE' : ddbJobs.table_name,
                 'CONSENSUS_QUEUE' : sqsConsensus.queue_url, 
-                'BUCKET' : s3GenomeAccess.attr_arn
+                'BUCKET' : s3GenomeAccess.attr_alias
             }
         )
 
 
-        s3Genome.grant_read_write(lambdaConsensus)   
-        lambdaConsensus.add_to_role_policy(lambdaS3AccessPointIAM)
+     
+        lambdaConsensus.add_to_role_policy(policyAccessS3GenomeBucket)
 
         sqsConsensus.grant_consume_messages(lambdaConsensus)
         lambdaConsensus.add_event_source_mapping(
@@ -668,7 +653,7 @@ class CracklingStack(Stack):
             memory_size= 10240,
             ephemeral_storage_size = cdk.Size.gibibytes(10),
             environment={
-                'BUCKET' : s3GenomeAccess.attr_arn,
+                'BUCKET' : s3GenomeAccess.attr_alias,
                 'TASK_TRACKING_TABLE' : ddbTaskTracking.table_name,
                 'TARGETS_TABLE' : ddbTargets.table_name,
                 'JOBS_TABLE' : ddbJobs.table_name,
@@ -688,8 +673,36 @@ class CracklingStack(Stack):
         ddbJobs.grant_read_write_data(lambdaIssl)
         ddbTaskTracking.grant_read_write_data(lambdaIssl)
         ddbTargets.grant_read_write_data(lambdaIssl)
-        s3Genome.grant_read_write(lambdaIssl)
-        lambdaIssl.add_to_role_policy(lambdaS3AccessPointIAM)
+        lambdaIssl.add_to_role_policy(policyAccessS3GenomeBucket)
+        
+        
+
+        s3Genome.add_to_resource_policy(
+            iam_.PolicyStatement(
+                effect=iam_.Effect.ALLOW,
+                principals=[
+                    iam_.ArnPrincipal(lambdaGenomeDownloadScheduler.role.role_arn),
+                    iam_.ArnPrincipal(lambdaCustomDataUpload.role.role_arn),
+                    iam_.ArnPrincipal(lambdaGenomePartsDownloader.role.role_arn),
+                    iam_.ArnPrincipal(lambdaExtractOfftargets.role.role_arn),
+                    iam_.ArnPrincipal(lambdaIsslCreation.role.role_arn),
+                    iam_.ArnPrincipal(lambdaConsensus.role.role_arn),
+                    iam_.ArnPrincipal(lambdaIssl.role.role_arn),
+                ],
+                actions=[
+                    "s3:GetObject",
+                    "s3:PutObject",
+                    "s3:ListBucket",
+                    "s3:AbortMultipartUpload",
+                    "s3:ListMultipartUploadParts"
+                ],
+                resources=[
+                    s3Genome.bucket_arn,
+                    f"{s3Genome.bucket_arn}/*"
+                ]
+            )
+        )
+
 
         ### API
         # This handles the staging and deployment of the API. A ClouydFormation output is generated with the API URL.
