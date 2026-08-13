@@ -18,6 +18,7 @@ except:
 # Global variables
 s3_bucket = os.environ['BUCKET']
 TARGET_SCAN_QUEUE = os.environ['QUEUE']
+COORDINATOR_QUEUE = os.environ['COORDINATOR_QUEUE']
 #byte - megabyte magnitude
 BYTE_TO_MB_DIVIDER = 1048576
 #max fasta file size
@@ -151,6 +152,15 @@ def lambda_handler(event, context):
 
     # Create issl files
     isslcreate(accession, tmp_dir)
+
+    # The ISSL is now present in S3. Coordinate its five shard ranges once,
+    # independently of the per-guide messages produced later by Target Scan.
+    coordinator_message = json.dumps({
+        'schemaVersion': 1,
+        'JobID': jobid,
+        'Genome': accession,
+    })
+    sqs_send_message(COORDINATOR_QUEUE, coordinator_message)
 
     sqs_send_message(TARGET_SCAN_QUEUE, json_object) 
 
