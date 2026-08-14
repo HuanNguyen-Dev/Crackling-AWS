@@ -527,7 +527,14 @@ class CracklingStack(Stack):
                 'PATH' : path
             }
         )
+        sqsIssl.grant_consume_messages(lambdaIsslScorer)
         sqsIssl.grant_send_messages(lambdaIsslScorer)
+        lambdaIsslScorer.add_event_source_mapping(
+            "mapLdaIsslSqsIssl",
+            event_source_arn=sqsIssl.queue_arn,
+            batch_size=10, 
+            max_batching_window=Duration.seconds(5)
+        )
         ddbJobs.grant_read_write_data(lambdaIsslScorer)
         ddbTaskTracking.grant_read_write_data(lambdaIsslScorer)
         ddbTargets.grant_read_write_data(lambdaIsslScorer)
