@@ -578,6 +578,37 @@ class CracklingStack(Stack):
         )
         lambdaIsslMapper.add_to_role_policy(policyAccessS3GenomeBucket)
 
+        ### Reduce a guide after all five Mapper completion markers exist.
+        # Mapper result events may arrive in any order; the Reducer invocation
+        # that observes all five markers performs the deterministic reduction.
+        lambdaIsslReducer = lambda_.Function(self, "lambdaIsslReducer",
+            runtime=lambda_.Runtime.PYTHON_3_10,
+            handler="lambda_function.lambda_handler",
+            code=lambda_.Code.from_asset("../modules/isslReducer"),
+            vpc=cracklingVpc,
+            vpc_subnets=ec2_.SubnetSelection(subnet_type=ec2_.SubnetType.PRIVATE_ISOLATED),
+            timeout=duration,
+            memory_size=4096,
+            ephemeral_storage_size=cdk.Size.gibibytes(10),
+            environment={
+                'TARGETS_TABLE': ddbTargets.table_name,
+                'TASK_TRACKING_TABLE': ddbTaskTracking.table_name,
+                'SHARD_COUNT': '5'
+            }
+        )
+        lambdaIsslReducer.add_to_role_policy(policyAccessS3GenomeBucket)
+        ddbTargets.grant_read_write_data(lambdaIsslReducer)
+        ddbTaskTracking.grant_read_write_data(lambdaIsslReducer)
+        lambdaIsslReducer.add_to_role_policy(iam_.PolicyStatement(
+            actions=['dynamodb:TransactWriteItems'],
+            resources=[ddbTargets.table_arn, ddbTaskTracking.table_arn]
+        ))
+        s3Genome.add_event_notification(
+            s3_.EventType.OBJECT_CREATED,
+            s3n_.LambdaDestination(lambdaIsslReducer),
+            s3_.NotificationKeyFilter(suffix='result.json')
+        )
+
         cdk.CfnOutput(
             self,
             "IsslMapperQueueUrl",
