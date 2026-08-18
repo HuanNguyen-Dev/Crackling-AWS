@@ -12,12 +12,8 @@ DOUBLE_BYTES = 8
 ISSL_HEADER_BYTES = ISSL_HEADER_FIELDS * SIZE_T_BYTES
 
 BUCKET = os.environ['BUCKET']
-MAPPER_QUEUE_URL = os.environ['MAPPER_QUEUE']
+TARGET_SCAN_QUEUE_URL = os.environ['TARGET_SCAN_QUEUE']
 NUM_SHARDS = int(os.getenv('NUM_SHARDS', '5'))
-MAX_DISTANCE = int(os.getenv('MAX_DISTANCE', '4'))
-SCORE_THRESHOLD = float(os.getenv('SCORE_THRESHOLD', '75'))
-SCORE_METHOD = os.getenv('SCORE_METHOD', 'mit')
-
 s3_client = boto3.client('s3')
 sqs_client = boto3.client('sqs')
 
@@ -133,42 +129,10 @@ def _parse_record(record):
     if message.get('schemaVersion') != 1:
         raise ValueError('Unsupported or missing Coordinator message schemaVersion')
 
-    for field in ('JobID', 'Genome'):
+    for field in ('JobID', 'Genome', 'Sequence'):
         if field not in message:
             raise ValueError(f'Coordinator message is missing {field}')
     return message
-
-
-def _mapper_task(message, issl_key, output_prefix, shard):
-    return {
-        'schemaVersion': 1,
-        'jobId': message['JobID'],
-        'genome': message['Genome'],
-        'shardId': shard['shardId'],
-        'shardCount': NUM_SHARDS,
-        'startSlice': shard['startSlice'],
-        'endSlice': shard['endSlice'],
-        'startByte': shard['startByte'],
-        'endByte': shard['endByte'],
-        'issl': {
-            'bucket': BUCKET,
-            'key': issl_key,
-        },
-        'query': {
-            'type': 'dynamodb',
-            'jobId': message['JobID'],
-            'status': 'pending-target-scan',
-        },
-        'scoring': {
-            'maxDistance': MAX_DISTANCE,
-            'scoreThreshold': SCORE_THRESHOLD,
-            'scoreMethod': SCORE_METHOD,
-        },
-        'output': {
-            'bucket': BUCKET,
-            'prefix': f'{output_prefix}/mapper',
-        },
-    }
 
 
 def _process_job(message):
@@ -179,11 +143,6 @@ def _process_job(message):
 
     layout = _read_issl_layout(issl_key)
     shards = _calculate_shards(layout)
-    tasks = [
-        _mapper_task(message, issl_key, output_prefix, shard)
-        for shard in shards
-    ]
-
     audit_document = {
         'schemaVersion': 1,
         'jobId': job_id,
@@ -213,32 +172,22 @@ def _process_job(message):
         'shards': shards,
     }))
 
-    response = sqs_client.send_message_batch(
-        QueueUrl=MAPPER_QUEUE_URL,
-        Entries=[
-            {
-                'Id': str(task['shardId']),
-                'MessageBody': json.dumps(task),
-            }
-            for task in tasks
-        ],
+    # Target Scan is released only after the complete shard manifest exists.
+    # Its algorithm and input contract remain unchanged.
+    response = sqs_client.send_message(
+        QueueUrl=TARGET_SCAN_QUEUE_URL,
+        MessageBody=json.dumps({
+            'Genome': genome,
+            'Sequence': message['Sequence'],
+            'JobID': job_id,
+        }),
     )
-    if response.get('Failed'):
-        raise RuntimeError(
-            f'Failed to publish Mapper tasks: {json.dumps(response["Failed"])}'
-        )
-    successful_count = len(response.get('Successful', []))
-    if successful_count != NUM_SHARDS:
-        raise RuntimeError(
-            f'Expected {NUM_SHARDS} successful Mapper messages, received '
-            f'{successful_count}'
-        )
 
     print(json.dumps({
-        'event': 'mapper_tasks_published',
+        'event': 'target_scan_released',
         'jobId': job_id,
-        'count': successful_count,
-        'queueUrl': MAPPER_QUEUE_URL,
+        'messageId': response.get('MessageId'),
+        'queueUrl': TARGET_SCAN_QUEUE_URL,
     }))
 
 
