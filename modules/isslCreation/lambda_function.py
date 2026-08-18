@@ -1,178 +1,213 @@
-import sys, os, shutil, boto3
-import zipfile, gzip
-import tempfile
+"""Dispatch and de-duplicate parallel ISSL index builds."""
 
-from threading import Thread
-from botocore.exceptions import ClientError, ParamValidationError
-from time import time,time_ns, sleep
-from datetime import datetime
+import hashlib
+import json
+import os
+from datetime import datetime, timezone
 
-from common_funcs import *
+import boto3
+from botocore.exceptions import ClientError
 
-try:
-    import extractOfftargets
-except:
-    sys.path.insert(0, '/opt/python/crackling/utils/')
-    import extractOfftargets
 
-# Global variables
-s3_bucket = os.environ['BUCKET']
+BUCKET = os.environ['BUCKET']
+BUILD_TABLE_NAME = os.environ['BUILD_TABLE']
+WORK_QUEUE = os.environ['WORK_QUEUE']
 TARGET_SCAN_QUEUE = os.environ['QUEUE']
 COORDINATOR_QUEUE = os.environ['COORDINATOR_QUEUE']
-#byte - megabyte magnitude
-BYTE_TO_MB_DIVIDER = 1048576
-#max fasta file size
-CUT_OFF_MB = 650
-    
-# Create S3 client
+ALGORITHM_VERSION = os.getenv('ISSL_ALGORITHM_VERSION', 'parallel-v1')
+
 s3_client = boto3.client('s3')
-s3_resource = boto3.resource('s3')
-
-#determine if fasta file exists and return its size
-def fasta_size_check(accession):
-    #filesize = s3_fasta_dir_size(s3_client,s3_bucket,os.path.join(accession,'fasta/')) ## see if function is used elsewhere 
-    filesize = s3_fna_dir_size(s3_client,s3_bucket,os.path.join(accession,'fasta/'))
-    if(filesize < 1):
-        print(s3_client)
-        print(s3_bucket)
-        print("This is the filesize")
-        print(filesize)
-        sys.exit("Error - Accession file is missing.")
-    filesize_in_MB = filesize/BYTE_TO_MB_DIVIDER
-
-    # notImplemented -  (requires Carl's issl split implemention of CracklingPlusPlus)
-    # Details - the memory bottleneck is reached at CUT_OFF_MB (600-650) due to file being written on memory.
-    # It takes 10 minutes to construct at the CUT_OFF_MB fasta size and lambda has a limit of 15 minutes.
-    print(filesize_in_MB)
-    if (filesize_in_MB > CUT_OFF_MB):
-        sys.exit("Error - Accession file is larger than function can handle (memory bottleneck) - 24/09/2023")
-    return filesize_in_MB
+sqs_client = boto3.client('sqs')
+build_table = boto3.resource('dynamodb').Table(BUILD_TABLE_NAME)
 
 
+def _now():
+    return datetime.now(timezone.utc).isoformat()
 
-# Downloads and unzips multiple fasta files from S3 bucket 
-def s3_multi_file_to_tmp(s3_client, s3_bucket, accession):
 
-    prefix = f"{accession}/fasta/"
+def _message_body(record):
+    body = json.loads(record['body']) if isinstance(record.get('body'), str) else record['body']
+    if 'default' in body:
+        body = json.loads(body['default'])
+    for field in ('Genome', 'Sequence', 'JobID'):
+        if field not in body:
+            raise ValueError(f'ISSL creation request is missing {field}')
+    return body
+
+
+def _source_manifest(genome):
     paginator = s3_client.get_paginator('list_objects_v2')
-    response_iterator = paginator.paginate(Bucket=s3_bucket, Prefix=prefix)
-
-    downloaded_files = []
-
-    # Extract all .fna file names for genome accession 
-    for page in response_iterator:
-        files = [obj['Key'] for obj in page.get('Contents', [])]
-
-        for s3_file_path in files:
-            file_name = os.path.basename(s3_file_path)
-            print(file_name)
-            downloaded_files.append(file_name)
-
-    # Temp folder for zipped files 
-    tmp_dir = get_tmp_dir()
-    # Temp folder for unzipped files 
-    tmp_extract_dir = get_tmp_dir()
-    # unzipped .fna file names 
-    extracted_files = []
-
-    for file in downloaded_files:
-
-        fasta_file_name = file
-        s3_full_filepath = f"{accession}/fasta/{fasta_file_name}"
-        print(f"This is the fasta file name {fasta_file_name}")
-
-        # Use temp directory for file writing in local
-        tmp_gz_file = os.path.join(tmp_dir, fasta_file_name)
-         
-        # download each .fna file from S3
-        print(f"Downloading {s3_full_filepath} to {tmp_gz_file}")
-        s3_client.download_file(s3_bucket, s3_full_filepath, tmp_gz_file)
-
-        # Unzip the downloaded .gz file
-        tmp_extract_file = os.path.join(tmp_extract_dir, os.path.splitext(fasta_file_name)[0])  # Remove .gz extension
-        with gzip.open(tmp_gz_file, 'rb') as f_in:
-            with open(tmp_extract_file, 'wb') as f_out:
-                shutil.copyfileobj(f_in, f_out)
-        extracted_files.append(tmp_extract_file)
-
-        os.remove(tmp_gz_file)
-        print(f"Deleted temporary gz file: {tmp_gz_file}")
-
-    # print extracted files 
-    print(extracted_files)
-    return extracted_files, tmp_extract_dir
+    sources = []
+    for page in paginator.paginate(Bucket=BUCKET, Prefix=f'{genome}/fasta/'):
+        for item in page.get('Contents', []):
+            if item['Size'] <= 0 or item['Key'].endswith('/'):
+                continue
+            sources.append({
+                'bucket': BUCKET,
+                'key': item['Key'],
+                'etag': item.get('ETag', '').strip('"'),
+                'size': int(item['Size']),
+            })
+    sources.sort(key=lambda item: item['key'])
+    if not sources:
+        raise ValueError(f'No FASTA objects found for genome {genome}')
+    return sources
 
 
+def _build_id(genome, sources):
+    identity = json.dumps({
+        'genome': genome,
+        'algorithmVersion': ALGORITHM_VERSION,
+        'sources': sources,
+    }, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    return hashlib.sha256(identity).hexdigest()[:24]
 
-# Build isslIndex
-def isslcreate(accession, tmp_fasta_dir):
-    
-    print("\nExtracting Offtargets...")
 
-    # extract offtarget command
-    tmp_dir = get_tmp_dir()
-    offtargetfn = os.path.join(tmp_dir,f"{accession}.offtargets")
-    print(f"Creating: {offtargetfn}")
+def _send(queue_url, body):
+    sqs_client.send_message(QueueUrl=queue_url, MessageBody=json.dumps(body))
 
-    # Lambda code
-    extractOfftargets.startSequentalprocessing([tmp_fasta_dir], offtargetfn, 1, 100)
-    isslBin = "/opt/ISSL/isslCreateIndex"
 
-    issl_path = os.path.join(tmp_dir, f"{accession}.issl")
+def _release_ready_request(request, build_id):
+    genome = request['Genome']
+    job_id = str(request['JobID'])
+    key = {'Genome': genome, 'RecordId': f'REQUEST#{build_id}#{job_id}'}
+    current = build_table.get_item(Key=key, ConsistentRead=True).get('Item', request)
 
-    os.system(f"{isslBin} {offtargetfn} 20 8 {issl_path}")
+    if not current.get('coordinatorReleased'):
+        _send(COORDINATOR_QUEUE, {
+            'schemaVersion': 1,
+            'JobID': job_id,
+            'Genome': genome,
+        })
+        build_table.update_item(
+            Key=key,
+            UpdateExpression='SET coordinatorReleased = :true, updatedAt = :now',
+            ExpressionAttributeValues={':true': True, ':now': _now()},
+        )
 
-    s3_destination_path = f"{accession}/issl"
-    upload_dir_to_s3(s3_client, s3_bucket, tmp_dir, s3_destination_path)
+    if not current.get('targetScanReleased'):
+        _send(TARGET_SCAN_QUEUE, {
+            'Genome': genome,
+            'Sequence': request['Sequence'],
+            'JobID': job_id,
+        })
+        build_table.update_item(
+            Key=key,
+            UpdateExpression='SET targetScanReleased = :true, updatedAt = :now',
+            ExpressionAttributeValues={':true': True, ':now': _now()},
+        )
+
+
+def _register_request(request, build_id):
+    item = {
+        'Genome': request['Genome'],
+        'RecordId': f'REQUEST#{build_id}#{request["JobID"]}',
+        'buildId': build_id,
+        'JobID': str(request['JobID']),
+        'Sequence': request['Sequence'],
+        'status': 'WAITING',
+        'coordinatorReleased': False,
+        'targetScanReleased': False,
+        'createdAt': _now(),
+    }
+    try:
+        build_table.put_item(
+            Item=item,
+            ConditionExpression='attribute_not_exists(RecordId)',
+        )
+        return item
+    except ClientError as error:
+        if error.response['Error']['Code'] != 'ConditionalCheckFailedException':
+            raise
+        return build_table.get_item(
+            Key={'Genome': item['Genome'], 'RecordId': item['RecordId']},
+            ConsistentRead=True,
+        )['Item']
+
+
+def _create_build(genome, build_id, sources):
+    record_id = f'BUILD#{build_id}'
+    item = {
+        'Genome': genome,
+        'RecordId': record_id,
+        'buildId': build_id,
+        'algorithmVersion': ALGORITHM_VERSION,
+        'status': 'PLANNING',
+        'expectedTasks': len(sources),
+        'completedTasks': 0,
+        'phase': 'extract',
+        'round': 0,
+        'sourceManifest': sources,
+        'finalKey': f'{genome}/issl/{genome}.issl',
+        'createdAt': _now(),
+        'updatedAt': _now(),
+    }
+    try:
+        build_table.put_item(
+            Item=item,
+            ConditionExpression='attribute_not_exists(RecordId)',
+        )
+        return item, True
+    except ClientError as error:
+        if error.response['Error']['Code'] != 'ConditionalCheckFailedException':
+            raise
+        existing = build_table.get_item(
+            Key={'Genome': genome, 'RecordId': record_id},
+            ConsistentRead=True,
+        )['Item']
+        return existing, False
+
+
+def _dispatch_extract_tasks(build, sources):
+    genome = build['Genome']
+    build_id = build['buildId']
+    for index, source in enumerate(sources):
+        _send(WORK_QUEUE, {
+            'schemaVersion': 1,
+            'taskType': 'extract',
+            'stage': 'extract',
+            'genome': genome,
+            'buildId': build_id,
+            'taskId': f'extract-{index:06d}',
+            'source': source,
+            'outputKey': (
+                f'{genome}/issl-builds/{build_id}/extract/'
+                f'{index:06d}.run'
+            ),
+        })
+    build_table.update_item(
+        Key={'Genome': genome, 'RecordId': f'BUILD#{build_id}'},
+        UpdateExpression='SET #status = :status, updatedAt = :now',
+        ExpressionAttributeNames={'#status': 'status'},
+        ExpressionAttributeValues={':status': 'EXTRACTING', ':now': _now()},
+    )
+
+
+def _process(request):
+    genome = str(request['Genome'])
+    sources = _source_manifest(genome)
+    build_id = _build_id(genome, sources)
+    waiting_request = _register_request(request, build_id)
+    build, created = _create_build(genome, build_id, sources)
+
+    if build.get('status') == 'READY':
+        try:
+            s3_client.head_object(Bucket=BUCKET, Key=build['finalKey'])
+        except ClientError:
+            raise RuntimeError('Build is marked READY but its final ISSL is missing')
+        _release_ready_request(waiting_request, build_id)
+        return
+
+    if created:
+        _dispatch_extract_tasks(build, sources)
 
 
 def lambda_handler(event, context):
-
-    args,body = recv(event)
-    accession = args['Genome']
-    sequence = args['Sequence']
-    jobid = args['JobID']
-
-    body ={ 
-        "Genome": accession, 
-        "Sequence": sequence, 
-        "JobID": jobid
-    }
-    json_object = json.dumps(body)
-
-    if accession == 'fail':
-        sys.exit('Error: No accession found.')
-
-    print(f"accession: {accession}")
-    
-    #check that file size meets current limitations - 600MB file
-    _ = fasta_size_check(accession)
-
-    tmp_dir_fasta, tmp_dir = s3_multi_file_to_tmp(s3_client, s3_bucket, accession)
-
-    # Create issl files
-    isslcreate(accession, tmp_dir)
-
-    # The ISSL is now present in S3. Coordinate its five shard ranges once,
-    # independently of the per-guide messages produced later by Target Scan.
-    coordinator_message = json.dumps({
-        'schemaVersion': 1,
-        'JobID': jobid,
-        'Genome': accession,
-    })
-    sqs_send_message(COORDINATOR_QUEUE, coordinator_message)
-
-    sqs_send_message(TARGET_SCAN_QUEUE, json_object) 
-
-    print("These are the extracted file names", tmp_dir_fasta)
-    
-    #close temp fasta file directory
-    if os.path.exists(tmp_dir):
-        print("Cleaning Up...")
-        shutil.rmtree(tmp_dir)
-
-    print("All Done... Terminating Program.")
-
-if __name__== "__main__":
-    event, context = local_lambda_invocation()
-    lambda_handler(event, context)
+    failures = []
+    for record in event.get('Records', []):
+        try:
+            _process(_message_body(record))
+        except Exception:
+            print(json.dumps({'event': 'issl_dispatch_failed', 'record': record}, default=str))
+            failures.append({'itemIdentifier': record.get('messageId', 'unknown')})
+    return {'batchItemFailures': failures}

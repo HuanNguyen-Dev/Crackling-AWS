@@ -44,6 +44,9 @@ jobs:
       - name: Create Lambda layer with lib dependencies (2/2)
         run: "ldd layers/rnaFold/rnaFold/RNAfold | grep \"=> /\" | awk '{print $3}' | xargs -I '{}' cp -v '{}' layers/sharedObjects"
 
+      - name: Build parallel ISSL index creator
+        run: g++ layers/isslCreation/ISSL/isslCreateIndex.cpp -o layers/isslCreation/ISSL/isslCreateIndex -O3 -std=c++11 -fopenmp -mpopcnt
+
       - name: CDK Synth
         run: cdk synth
         working-directory: aws

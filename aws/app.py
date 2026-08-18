@@ -174,6 +174,14 @@ class CracklingStack(Stack):
             stream=ddb_.StreamViewType.NEW_IMAGE
         )
 
+        ### Tracks one shared, parallel ISSL build and its requests/tasks per genome.
+        ddbIsslBuilds = ddb_.Table(self, "ddbIsslBuilds",
+            removal_policy=RemovalPolicy.DESTROY,
+            billing_mode=ddb_.BillingMode.PAY_PER_REQUEST,
+            partition_key=ddb_.Attribute(name="Genome", type=ddb_.AttributeType.STRING),
+            sort_key=ddb_.Attribute(name="RecordId", type=ddb_.AttributeType.STRING)
+        )
+
         ### Lambda is an event-driven compute service.
         # Some lambda functions may need additional resources - these are provided via layers.
 
@@ -248,6 +256,38 @@ class CracklingStack(Stack):
             receive_message_wait_time=Duration.seconds(1),
             visibility_timeout=duration,
             retention_period=duration
+        )
+
+        ### Failed parallel ISSL extraction/reduction tasks are retained for inspection.
+        sqsIsslCreationWorkDlq = sqs_.Queue(self, "sqsIsslCreationWorkDlq",
+            retention_period=Duration.days(14)
+        )
+
+        ### Parallel extraction and reduction tasks for a shared genome ISSL build.
+        sqsIsslCreationWork = sqs_.Queue(self, "sqsIsslCreationWork",
+            receive_message_wait_time=Duration.seconds(20),
+            visibility_timeout=Duration.hours(2),
+            retention_period=Duration.days(4),
+            dead_letter_queue=sqs_.DeadLetterQueue(
+                max_receive_count=3,
+                queue=sqsIsslCreationWorkDlq
+            )
+        )
+
+        ### Failed ISSL assembly tasks are retained separately from worker failures.
+        sqsIsslCreationFinalizeDlq = sqs_.Queue(self, "sqsIsslCreationFinalizeDlq",
+            retention_period=Duration.days(14)
+        )
+
+        ### Completed reducer sets are assembled and released downstream from here.
+        sqsIsslCreationFinalize = sqs_.Queue(self, "sqsIsslCreationFinalize",
+            receive_message_wait_time=Duration.seconds(20),
+            visibility_timeout=Duration.hours(2),
+            retention_period=Duration.days(4),
+            dead_letter_queue=sqs_.DeadLetterQueue(
+                max_receive_count=3,
+                queue=sqsIsslCreationFinalizeDlq
+            )
         )
 
         ### An SQS Deal Letter queue handles messages that have "died" in another queue.
@@ -418,6 +458,8 @@ class CracklingStack(Stack):
             environment={
                 'QUEUE' : sqsTargetScan.queue_url,
                 'COORDINATOR_QUEUE' : sqsIsslCoordinator.queue_url,
+                'WORK_QUEUE' : sqsIsslCreationWork.queue_url,
+                'BUILD_TABLE' : ddbIsslBuilds.table_name,
                 'BUCKET' : s3GenomeAccess.attr_alias,
                 'LD_LIBRARY_PATH' : ld_library_path,
                 'PATH' : path
@@ -427,12 +469,79 @@ class CracklingStack(Stack):
         sqsIsslCreation.grant_consume_messages(lambdaIsslScorerCreation)
         sqsTargetScan.grant_send_messages(lambdaIsslScorerCreation)
         sqsIsslCoordinator.grant_send_messages(lambdaIsslScorerCreation)
+        sqsIsslCreationWork.grant_send_messages(lambdaIsslScorerCreation)
+        ddbIsslBuilds.grant_read_write_data(lambdaIsslScorerCreation)
         lambdaIsslScorerCreation.add_event_source_mapping(
             "mapIsslCreation",
             event_source_arn=sqsIsslCreation.queue_arn,
-            batch_size=1
+            batch_size=1,
+            report_batch_item_failures=True
         )
         lambdaIsslScorerCreation.add_to_role_policy(policyAccessS3GenomeBucket)
+
+        ### Executes parallel extraction and reduction tasks for ISSL creation.
+        lambdaIsslCreationWorker = lambda_.Function(self, "lambdaIsslCreationWorker",
+            runtime=lambda_.Runtime.PYTHON_3_10,
+            handler="lambda_function.lambda_handler",
+            code=lambda_.Code.from_asset("../modules/isslCreationWorker"),
+            layers=[lambdaLayerIsslScorerCreation, lambdaLayerCommonFuncs, lambdaLayerLib],
+            vpc=cracklingVpc,
+            vpc_subnets=ec2_.SubnetSelection(subnet_type=ec2_.SubnetType.PRIVATE_ISOLATED),
+            timeout=duration,
+            memory_size=10240,
+            ephemeral_storage_size=cdk.Size.gibibytes(10),
+            environment={
+                'WORK_QUEUE': sqsIsslCreationWork.queue_url,
+                'FINALIZE_QUEUE': sqsIsslCreationFinalize.queue_url,
+                'BUILD_TABLE': ddbIsslBuilds.table_name,
+                'BUCKET': s3GenomeAccess.attr_alias,
+                'LD_LIBRARY_PATH': ld_library_path,
+                'PATH': path
+            }
+        )
+        sqsIsslCreationWork.grant_consume_messages(lambdaIsslCreationWorker)
+        sqsIsslCreationWork.grant_send_messages(lambdaIsslCreationWorker)
+        sqsIsslCreationFinalize.grant_send_messages(lambdaIsslCreationWorker)
+        ddbIsslBuilds.grant_read_write_data(lambdaIsslCreationWorker)
+        lambdaIsslCreationWorker.add_event_source_mapping(
+            "mapIsslCreationWork",
+            event_source_arn=sqsIsslCreationWork.queue_arn,
+            batch_size=1,
+            report_batch_item_failures=True
+        )
+        lambdaIsslCreationWorker.add_to_role_policy(policyAccessS3GenomeBucket)
+
+        ### Assembles a completed parallel build and releases all waiting jobs.
+        lambdaIsslCreationFinalizer = lambda_.Function(self, "lambdaIsslCreationFinalizer",
+            runtime=lambda_.Runtime.PYTHON_3_10,
+            handler="lambda_function.lambda_handler",
+            code=lambda_.Code.from_asset("../modules/isslCreationFinalizer"),
+            layers=[lambdaLayerIsslScorerCreation, lambdaLayerCommonFuncs, lambdaLayerLib],
+            vpc=cracklingVpc,
+            vpc_subnets=ec2_.SubnetSelection(subnet_type=ec2_.SubnetType.PRIVATE_ISOLATED),
+            timeout=duration,
+            memory_size=10240,
+            ephemeral_storage_size=cdk.Size.gibibytes(10),
+            environment={
+                'TARGET_SCAN_QUEUE': sqsTargetScan.queue_url,
+                'COORDINATOR_QUEUE': sqsIsslCoordinator.queue_url,
+                'BUILD_TABLE': ddbIsslBuilds.table_name,
+                'BUCKET': s3GenomeAccess.attr_alias,
+                'LD_LIBRARY_PATH': ld_library_path,
+                'PATH': path
+            }
+        )
+        sqsIsslCreationFinalize.grant_consume_messages(lambdaIsslCreationFinalizer)
+        sqsTargetScan.grant_send_messages(lambdaIsslCreationFinalizer)
+        sqsIsslCoordinator.grant_send_messages(lambdaIsslCreationFinalizer)
+        ddbIsslBuilds.grant_read_write_data(lambdaIsslCreationFinalizer)
+        lambdaIsslCreationFinalizer.add_event_source_mapping(
+            "mapIsslCreationFinalize",
+            event_source_arn=sqsIsslCreationFinalize.queue_arn,
+            batch_size=1,
+            report_batch_item_failures=True
+        )
+        lambdaIsslCreationFinalizer.add_to_role_policy(policyAccessS3GenomeBucket)
         
         ### Lambda function that scans a sequence for CRISPR sites.
         # This function is triggered when a record is written to the DynamoDB jobs table.
