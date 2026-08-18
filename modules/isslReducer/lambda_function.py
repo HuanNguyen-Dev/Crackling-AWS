@@ -12,6 +12,8 @@ from botocore.exceptions import ClientError
 
 
 SHARD_COUNT = int(os.getenv('SHARD_COUNT', '5'))
+TARGETS_TABLE = os.getenv('TARGETS_TABLE')
+TASK_TRACKING_TABLE = os.getenv('TASK_TRACKING_TABLE')
 SCORE_RECORD = struct.Struct('<Id')
 MAPPER_MARKER_PATTERN = re.compile(
     r'^(?P<genome>.+)/mapper/(?P<job_id>[^/]+)/targets/'
@@ -19,6 +21,7 @@ MAPPER_MARKER_PATTERN = re.compile(
 )
 
 s3_client = boto3.client('s3')
+dynamodb_client = boto3.client('dynamodb')
 
 
 def _mapper_event(record):
@@ -223,8 +226,75 @@ def _reduce(trigger, markers):
         },
         'outputs': {'mit': keys['mit'], 'cfd': keys['cfd']},
     }
-    _write_json(trigger['bucket'], keys['result'], result)
-    return result
+    return result, keys
+
+
+def _completion_id(trigger):
+    return f'{trigger["jobId"]}:{trigger["targetId"]}'
+
+
+def _record_pipeline_completion(trigger, scores):
+    if not TARGETS_TABLE or not TASK_TRACKING_TABLE:
+        raise ValueError('Reducer DynamoDB table environment is not configured')
+
+    completion_id = _completion_id(trigger)
+    try:
+        dynamodb_client.transact_write_items(
+            TransactItems=[
+                {
+                    'Update': {
+                        'TableName': TARGETS_TABLE,
+                        'Key': {
+                            'JobID': {'S': trigger['jobId']},
+                            'TargetID': {'N': str(trigger['targetId'])},
+                        },
+                        'UpdateExpression': (
+                            'SET IsslScore = :mit, CfdScore = :cfd, '
+                            'ReducerTaskId = :task'
+                        ),
+                        'ConditionExpression': (
+                            'attribute_exists(JobID) AND '
+                            'attribute_not_exists(ReducerTaskId)'
+                        ),
+                        'ExpressionAttributeValues': {
+                            ':mit': {'S': json.dumps(scores['mit'])},
+                            ':cfd': {'S': json.dumps(scores['cfd'])},
+                            ':task': {'S': completion_id},
+                        },
+                    },
+                },
+                {
+                    'Update': {
+                        'TableName': TASK_TRACKING_TABLE,
+                        'Key': {'JobID': {'S': trigger['jobId']}},
+                        'UpdateExpression': (
+                            'ADD NumScoredOfftarget :one, Version :one'
+                        ),
+                        'ConditionExpression': 'attribute_exists(JobID)',
+                        'ExpressionAttributeValues': {
+                            ':one': {'N': '1'},
+                        },
+                    },
+                },
+            ],
+        )
+        return True
+    except ClientError as error:
+        if error.response.get('Error', {}).get('Code') != 'TransactionCanceledException':
+            raise
+
+        target = dynamodb_client.get_item(
+            TableName=TARGETS_TABLE,
+            Key={
+                'JobID': {'S': trigger['jobId']},
+                'TargetID': {'N': str(trigger['targetId'])},
+            },
+            ConsistentRead=True,
+        ).get('Item', {})
+        recorded_id = target.get('ReducerTaskId', {}).get('S')
+        if recorded_id == completion_id:
+            return False
+        raise
 
 
 def lambda_handler(event, context):
@@ -240,12 +310,28 @@ def lambda_handler(event, context):
         if markers is None:
             waiting += 1
             continue
-        result = _reduce(trigger, markers)
+        keys = _result_keys(trigger)
+        existing_result = _get_json(
+            trigger['bucket'], keys['result'], missing_is_none=True,
+        )
+        if existing_result is not None:
+            processed += 1
+            continue
+
+        result, keys = _reduce(trigger, markers)
+        pipeline_updated = _record_pipeline_completion(
+            trigger, result['scores'],
+        )
+        result['pipelineStatus'] = 'complete'
+        # The final marker is written only after both score objects and the
+        # existing DynamoDB completion pipeline have succeeded.
+        _write_json(trigger['bucket'], keys['result'], result)
         processed += 1
         print(json.dumps({
             'event': 'reducer_complete',
             'jobId': trigger['jobId'],
             'targetId': trigger['targetId'],
             'scores': result['scores'],
+            'pipelineUpdated': pipeline_updated,
         }))
     return {'processed': processed, 'waiting': waiting, 'ignored': ignored}
