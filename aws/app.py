@@ -184,6 +184,13 @@ class CracklingStack(Stack):
             removal_policy=RemovalPolicy.DESTROY
         )
 
+        ### C++ Mapper used by the distributed off-target scoring path.
+        lambdaLayerIsslMapper = lambda_.LayerVersion(self, "lambdaLayerIsslMapper",
+            code=lambda_.Code.from_asset("../layers/isslMapper"),
+            removal_policy=RemovalPolicy.DESTROY,
+            compatible_architectures=[lambda_.Architecture.X86_64]
+        )
+
         ### Lambda layer containing python3.10 packages for requests
         lambdaLayerRequests = lambda_.LayerVersion(self, "lambdaLayerRequests",
             code=lambda_.Code.from_asset("../layers/requestsPy310Pkgs"),
@@ -545,6 +552,31 @@ class CracklingStack(Stack):
             batch_size=1
         )
         lambdaIsslCoordinator.add_to_role_policy(policyAccessS3GenomeBucket)
+
+        ### Score one candidate guide against one Coordinator shard. Results
+        # are persisted as separate compact MIT and CFD objects for Stage 3.
+        lambdaIsslMapper = lambda_.Function(self, "lambdaIsslMapper",
+            runtime=lambda_.Runtime.PYTHON_3_10,
+            handler="lambda_function.lambda_handler",
+            code=lambda_.Code.from_asset("../modules/isslMapper"),
+            layers=[lambdaLayerIsslMapper, lambdaLayerLib],
+            vpc=cracklingVpc,
+            vpc_subnets=ec2_.SubnetSelection(subnet_type=ec2_.SubnetType.PRIVATE_ISOLATED),
+            timeout=duration,
+            memory_size=10240,
+            ephemeral_storage_size=cdk.Size.gibibytes(10),
+            environment={
+                'LD_LIBRARY_PATH': ld_library_path,
+                'OMP_NUM_THREADS': '6'
+            }
+        )
+        sqsIsslMapper.grant_consume_messages(lambdaIsslMapper)
+        lambdaIsslMapper.add_event_source_mapping(
+            "mapLdaIsslSqsMapper",
+            event_source_arn=sqsIsslMapper.queue_arn,
+            batch_size=1
+        )
+        lambdaIsslMapper.add_to_role_policy(policyAccessS3GenomeBucket)
 
         cdk.CfnOutput(
             self,

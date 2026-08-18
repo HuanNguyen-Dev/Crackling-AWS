@@ -280,7 +280,7 @@ See here: https://www.commandlinefu.com/commands/view/10238/copy-all-shared-libr
 Working in the root directory of the repo, run:
 
 ```bash
-ldd layers/isslScoreOfftargets/isslScoreOfftargets | grep "=> /" | awk '{print $3}' | xargs -I '{}' cp -v '{}' layers/sharedObjects
+ldd layers/isslMapper/mapper | grep "=> /" | awk '{print $3}' | xargs -I '{}' cp -v '{}' layers/sharedObjects
 ```
 
 then
