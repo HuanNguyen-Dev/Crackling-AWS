@@ -505,9 +505,9 @@ class CracklingStack(Stack):
         ddbJobs.grant_read_write_data(lambdaConsensus)
 
 
-        ### Existing Lambda function that assesses guide specificity using ISSL.
-        # Its implementation is retained for rollback/comparison, but its SQS
-        # trigger is intentionally disconnected during the Coordinator stage.
+        ### Lambda function that assesses guide specificity using ISSL.
+        # This function consumes messages in the SQS Issl queue.
+        # The results are written to the DynamoDB consensus table.
         lambdaIsslScorer = lambda_.Function(self, "lambdaIsslScorer", 
             runtime=lambda_.Runtime.PYTHON_3_10,
             handler="lambda_function.lambda_handler",
