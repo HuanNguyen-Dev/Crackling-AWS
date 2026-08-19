@@ -290,7 +290,7 @@ class CracklingStack(Stack):
             retention_period=Duration.minutes(30)
         )
 
-        ### Internal queue containing one task per guide and ISSL shard.
+        ### Internal queue containing one guide-batch task per ISSL shard.
         sqsIsslMapper = sqs_.Queue(self, "sqsIsslMapper",
             receive_message_wait_time=Duration.seconds(20),
             visibility_timeout=duration,
@@ -501,7 +501,8 @@ class CracklingStack(Stack):
         ddbJobs.grant_read_write_data(lambdaConsensus)
 
 
-        ### Fan each Target Scan guide out to all five ISSL shards.
+        ### Group each SQS guide batch by job/genome and fan it out to all five
+        # ISSL shards.
         lambdaIsslDispatcher = lambda_.Function(self, "lambdaIsslDispatcher",
             runtime=lambda_.Runtime.PYTHON_3_10,
             handler="lambda_function.lambda_handler",
@@ -553,8 +554,8 @@ class CracklingStack(Stack):
         )
         lambdaIsslCoordinator.add_to_role_policy(policyAccessS3GenomeBucket)
 
-        ### Score one candidate guide against one Coordinator shard. Results
-        # are persisted as separate compact MIT and CFD objects for Stage 3.
+        ### Score one candidate-guide batch against one Coordinator shard.
+        # Results remain separated per guide for Stage 3 reduction.
         lambdaIsslMapper = lambda_.Function(self, "lambdaIsslMapper",
             runtime=lambda_.Runtime.PYTHON_3_10,
             handler="lambda_function.lambda_handler",

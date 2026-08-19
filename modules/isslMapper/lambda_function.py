@@ -4,6 +4,7 @@ import shutil
 import struct
 import subprocess
 import tempfile
+from contextlib import ExitStack
 
 import boto3
 from botocore.exceptions import ClientError
@@ -20,30 +21,52 @@ s3_client = boto3.client('s3')
 
 def _parse_task(record):
     task = json.loads(record['body'])
-    if task.get('schemaVersion') != 2:
+    if task.get('schemaVersion') != 3:
         raise ValueError('Unsupported or missing Mapper task schemaVersion')
 
     required = (
-        'taskId', 'jobId', 'targetId', 'guideSequence', 'genome',
+        'batchId', 'jobId', 'guides', 'genome',
         'shardId', 'shardCount', 'startSlice', 'endSlice',
-        'startByte', 'endByte', 'issl', 'output',
+        'startByte', 'endByte', 'issl', 'manifest', 'output',
     )
     for field in required:
         if field not in task:
             raise ValueError(f'Mapper task is missing {field}')
 
-    guide = task['guideSequence'][:20].upper()
-    if len(guide) != 20 or any(base not in 'ACGT' for base in guide):
-        raise ValueError('Mapper guide must begin with exactly 20 A/C/G/T bases')
-    task['guideSequence'] = guide
+    if not task['guides']:
+        raise ValueError('Mapper task must contain at least one guide')
+
+    target_ids = set()
+    guide_sequences = set()
+    for guide in task['guides']:
+        for field in ('taskId', 'targetId', 'guideSequence', 'output'):
+            if field not in guide:
+                raise ValueError(f'Mapper guide is missing {field}')
+        for field in ('mitKey', 'cfdKey', 'metadataKey'):
+            if field not in guide['output']:
+                raise ValueError(f'Mapper guide output is missing {field}')
+        sequence = guide['guideSequence'][:20].upper()
+        if len(sequence) != 20 or any(base not in 'ACGT' for base in sequence):
+            raise ValueError(
+                'Each Mapper guide must begin with exactly 20 A/C/G/T bases'
+            )
+        target_id = int(guide['targetId'])
+        if target_id in target_ids:
+            raise ValueError(f'Duplicate target ID in Mapper batch: {target_id}')
+        if sequence in guide_sequences:
+            raise ValueError(f'Duplicate guide sequence in Mapper batch: {sequence}')
+        target_ids.add(target_id)
+        guide_sequences.add(sequence)
+        guide['targetId'] = target_id
+        guide['guideSequence'] = sequence
     return task
 
 
-def _already_complete(task):
-    output = task['output']
+def _already_complete(task, guide):
+    output = guide['output']
     try:
         response = s3_client.get_object(
-            Bucket=output['bucket'],
+            Bucket=task['output']['bucket'],
             Key=output['metadataKey'],
         )
     except ClientError as error:
@@ -52,7 +75,7 @@ def _already_complete(task):
         raise
 
     metadata = json.loads(response['Body'].read())
-    return metadata.get('taskId') == task['taskId']
+    return metadata.get('taskId') == guide['taskId']
 
 
 def _copy_s3_range(bucket, key, start, end, destination, offset):
@@ -101,11 +124,13 @@ def _materialize_sparse_issl(task, manifest, path):
     return prefix_bytes, shard_bytes
 
 
-def _write_mapper_inputs(task, directory):
+def _write_mapper_inputs(task, guides, directory):
     query_path = os.path.join(directory, 'query.txt')
     shard_path = os.path.join(directory, 'shard.txt')
     with open(query_path, 'w', newline='\n') as query_file:
-        query_file.write(f'{task["guideSequence"]}\n')
+        query_file.write(
+            ''.join(f'{guide["guideSequence"]}\n' for guide in guides)
+        )
     with open(shard_path, 'w', newline='\n') as shard_file:
         shard_file.write(
             f'{task["shardId"]} {task["startSlice"]} '
@@ -115,32 +140,66 @@ def _write_mapper_inputs(task, directory):
     return query_path, shard_path
 
 
-def _split_results(combined_path, mit_path, cfd_path):
-    input_records = 0
-    mit_records = 0
-    cfd_records = 0
-    with (
-        open(combined_path, 'rb') as combined,
-        open(mit_path, 'wb') as mit_output,
-        open(cfd_path, 'wb') as cfd_output,
-    ):
+def _sequence_to_signature(sequence):
+    nucleotide_index = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+    signature = 0
+    for position, nucleotide in enumerate(sequence):
+        signature |= nucleotide_index[nucleotide] << (position * 2)
+    return signature
+
+
+def _split_results(combined_path, guides, directory):
+    results = {}
+    signatures = {}
+    for guide in guides:
+        signature = _sequence_to_signature(guide['guideSequence'])
+        signatures[signature] = guide['targetId']
+        results[guide['targetId']] = {
+            'mapperRecords': 0,
+            'mitRecords': 0,
+            'cfdRecords': 0,
+            'mitPath': os.path.join(directory, f'{guide["targetId"]}-mit.bin'),
+            'cfdPath': os.path.join(directory, f'{guide["targetId"]}-cfd.bin'),
+        }
+
+    with ExitStack() as stack:
+        combined = stack.enter_context(open(combined_path, 'rb'))
+        outputs = {
+            target_id: {
+                'mit': stack.enter_context(open(result['mitPath'], 'wb')),
+                'cfd': stack.enter_context(open(result['cfdPath'], 'wb')),
+            }
+            for target_id, result in results.items()
+        }
         while True:
             record = combined.read(MAPPER_RESULT.size)
             if not record:
                 break
             if len(record) != MAPPER_RESULT.size:
                 raise ValueError('Mapper produced a truncated binary record')
-            _, target_id, mit_score, cfd_score = MAPPER_RESULT.unpack(record)
-            input_records += 1
-            if target_id == 0xFFFFFFFF:
+            query_signature, offtarget_id, mit_score, cfd_score = (
+                MAPPER_RESULT.unpack(record)
+            )
+            if query_signature not in signatures:
+                raise ValueError(
+                    f'Mapper returned unknown query signature {query_signature}'
+                )
+            target_id = signatures[query_signature]
+            result = results[target_id]
+            result['mapperRecords'] += 1
+            if offtarget_id == 0xFFFFFFFF:
                 continue
             if mit_score != 0.0:
-                mit_output.write(SCORE_RESULT.pack(target_id, mit_score))
-                mit_records += 1
+                outputs[target_id]['mit'].write(
+                    SCORE_RESULT.pack(offtarget_id, mit_score)
+                )
+                result['mitRecords'] += 1
             if cfd_score != 0.0:
-                cfd_output.write(SCORE_RESULT.pack(target_id, cfd_score))
-                cfd_records += 1
-    return input_records, mit_records, cfd_records
+                outputs[target_id]['cfd'].write(
+                    SCORE_RESULT.pack(offtarget_id, cfd_score)
+                )
+                result['cfdRecords'] += 1
+    return results
 
 
 def _run_mapper(task, directory, issl_path, query_path, shard_path):
@@ -176,18 +235,19 @@ def _run_mapper(task, directory, issl_path, query_path, shard_path):
     )
 
 
-def _upload_results(task, mit_path, cfd_path, metadata):
-    output = task['output']
+def _upload_results(task, guide, result, metadata):
+    output = guide['output']
+    bucket = task['output']['bucket']
     extra_args = {'ContentType': 'application/octet-stream'}
     s3_client.upload_file(
-        mit_path, output['bucket'], output['mitKey'], ExtraArgs=extra_args,
+        result['mitPath'], bucket, output['mitKey'], ExtraArgs=extra_args,
     )
     s3_client.upload_file(
-        cfd_path, output['bucket'], output['cfdKey'], ExtraArgs=extra_args,
+        result['cfdPath'], bucket, output['cfdKey'], ExtraArgs=extra_args,
     )
     # Written last: this object is the durable completion marker.
     s3_client.put_object(
-        Bucket=output['bucket'],
+        Bucket=bucket,
         Key=output['metadataKey'],
         Body=json.dumps(metadata, separators=(',', ':')).encode('utf-8'),
         ContentType='application/json',
@@ -195,8 +255,15 @@ def _upload_results(task, mit_path, cfd_path, metadata):
 
 
 def _process(task):
-    if _already_complete(task):
-        print(json.dumps({'event': 'mapper_task_already_complete', 'taskId': task['taskId']}))
+    guides = [
+        guide for guide in task['guides']
+        if not _already_complete(task, guide)
+    ]
+    if not guides:
+        print(json.dumps({
+            'event': 'mapper_batch_already_complete',
+            'batchId': task['batchId'],
+        }))
         return
 
     manifest_response = s3_client.get_object(
@@ -214,53 +281,52 @@ def _process(task):
         prefix_bytes, shard_bytes = _materialize_sparse_issl(
             task, manifest, issl_path,
         )
-        query_path, shard_path = _write_mapper_inputs(task, directory)
+        query_path, shard_path = _write_mapper_inputs(task, guides, directory)
         combined_path = _run_mapper(
             task, directory, issl_path, query_path, shard_path,
         )
-        mit_path = os.path.join(directory, 'mit.bin')
-        cfd_path = os.path.join(directory, 'cfd.bin')
-        input_records, mit_records, cfd_records = _split_results(
-            combined_path, mit_path, cfd_path,
+        results = _split_results(
+            combined_path, guides, directory,
         )
-        metadata = {
-            'schemaVersion': 1,
-            'taskId': task['taskId'],
-            'jobId': task['jobId'],
-            'targetId': task['targetId'],
-            'guideSequence': task['guideSequence'],
-            'genome': task['genome'],
-            'shardId': task['shardId'],
-            'shardCount': task['shardCount'],
-            'recordFormat': {
-                'endianness': 'little',
-                'fields': ['targetId:uint32', 'score:float64'],
-                'recordBytes': SCORE_RESULT.size,
-            },
-            'records': {
-                'mapper': input_records,
-                'mit': mit_records,
-                'cfd': cfd_records,
-            },
-            'materializedBytes': {
-                'indexPrefix': prefix_bytes,
-                'shard': shard_bytes,
-            },
-            'outputs': {
-                'mit': task['output']['mitKey'],
-                'cfd': task['output']['cfdKey'],
-            },
-        }
-        _upload_results(task, mit_path, cfd_path, metadata)
+        for guide in guides:
+            result = results[guide['targetId']]
+            metadata = {
+                'schemaVersion': 1,
+                'taskId': guide['taskId'],
+                'batchId': task['batchId'],
+                'jobId': task['jobId'],
+                'targetId': guide['targetId'],
+                'guideSequence': guide['guideSequence'],
+                'genome': task['genome'],
+                'shardId': task['shardId'],
+                'shardCount': task['shardCount'],
+                'recordFormat': {
+                    'endianness': 'little',
+                    'fields': ['targetId:uint32', 'score:float64'],
+                    'recordBytes': SCORE_RESULT.size,
+                },
+                'records': {
+                    'mapper': result['mapperRecords'],
+                    'mit': result['mitRecords'],
+                    'cfd': result['cfdRecords'],
+                },
+                'materializedBytes': {
+                    'indexPrefix': prefix_bytes,
+                    'shard': shard_bytes,
+                },
+                'outputs': {
+                    'mit': guide['output']['mitKey'],
+                    'cfd': guide['output']['cfdKey'],
+                },
+            }
+            _upload_results(task, guide, result, metadata)
 
     print(json.dumps({
-        'event': 'mapper_task_complete',
-        'taskId': task['taskId'],
+        'event': 'mapper_batch_complete',
+        'batchId': task['batchId'],
         'jobId': task['jobId'],
-        'targetId': task['targetId'],
+        'targetIds': [guide['targetId'] for guide in guides],
         'shardId': task['shardId'],
-        'mitRecords': mit_records,
-        'cfdRecords': cfd_records,
     }))
 
 

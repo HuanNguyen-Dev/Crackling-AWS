@@ -18,9 +18,6 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Update build environment
-        run: 'sudo apt update'
-
       - name: Setup Node.js 24
         uses: actions/setup-node@v3
         with:

@@ -41,25 +41,54 @@ def _load_manifest(genome):
     return key, manifest
 
 
-def _task_id(job_id, target_id, shard_id):
+def _guide_task_id(job_id, target_id, shard_id):
     value = f'{job_id}:{target_id}:{shard_id}'.encode('utf-8')
     return hashlib.sha256(value).hexdigest()
 
 
-def _mapper_task(guide, genome, manifest_key, manifest, shard):
+def _batch_id(job_id, target_ids, shard_id):
+    joined_targets = ','.join(str(target_id) for target_id in target_ids)
+    value = f'{job_id}:{joined_targets}:{shard_id}'.encode('utf-8')
+    return hashlib.sha256(value).hexdigest()
+
+
+def _guide_contract(guide, genome, shard_id):
     job_id = str(guide['JobID'])
     target_id = int(guide['TargetID'])
-    shard_id = int(shard['shardId'])
-    task_id = _task_id(job_id, target_id, shard_id)
-    output_prefix = f'{genome}/mapper/{job_id}/targets/{target_id}/shards/{shard_id}'
-
+    output_prefix = (
+        f'{genome}/mapper/{job_id}/targets/{target_id}/shards/{shard_id}'
+    )
     return {
-        'schemaVersion': 2,
-        'taskId': task_id,
-        'jobId': job_id,
+        'taskId': _guide_task_id(job_id, target_id, shard_id),
         'targetId': target_id,
         'guideSequence': guide['Sequence'],
+        'output': {
+            'prefix': output_prefix,
+            'mitKey': f'{output_prefix}/mit.bin',
+            'cfdKey': f'{output_prefix}/cfd.bin',
+            'metadataKey': f'{output_prefix}/result.json',
+        },
+    }
+
+
+def _mapper_task(guides, genome, manifest_key, manifest, shard):
+    job_id = str(guides[0]['JobID'])
+    shard_id = int(shard['shardId'])
+    guide_contracts = [
+        _guide_contract(guide, genome, shard_id)
+        for guide in sorted(guides, key=lambda item: int(item['TargetID']))
+    ]
+
+    return {
+        'schemaVersion': 3,
+        'batchId': _batch_id(
+            job_id,
+            [guide['targetId'] for guide in guide_contracts],
+            shard_id,
+        ),
+        'jobId': job_id,
         'genome': genome,
+        'guides': guide_contracts,
         'shardId': shard_id,
         'shardCount': NUM_SHARDS,
         'startSlice': int(shard['startSlice']),
@@ -75,19 +104,14 @@ def _mapper_task(guide, genome, manifest_key, manifest, shard):
         },
         'output': {
             'bucket': BUCKET,
-            'prefix': output_prefix,
-            'mitKey': f'{output_prefix}/mit.bin',
-            'cfdKey': f'{output_prefix}/cfd.bin',
-            'metadataKey': f'{output_prefix}/result.json',
         },
     }
 
 
-def _dispatch(record):
-    guide, genome = _parse_guide(record)
+def _dispatch(guides, genome):
     manifest_key, manifest = _load_manifest(genome)
     tasks = [
-        _mapper_task(guide, genome, manifest_key, manifest, shard)
+        _mapper_task(guides, genome, manifest_key, manifest, shard)
         for shard in manifest['shards']
     ]
     response = sqs_client.send_message_batch(
@@ -105,15 +129,25 @@ def _dispatch(record):
         raise RuntimeError('Mapper fan-out did not publish all five tasks')
 
     print(json.dumps({
-        'event': 'guide_dispatched',
-        'jobId': guide['JobID'],
-        'targetId': guide['TargetID'],
+        'event': 'guide_batch_dispatched',
+        'jobId': guides[0]['JobID'],
+        'targetIds': [int(guide['TargetID']) for guide in guides],
         'genome': genome,
-        'taskIds': [task['taskId'] for task in tasks],
+        'batchIds': [task['batchId'] for task in tasks],
     }))
 
 
 def lambda_handler(event, context):
+    groups = {}
     for record in event.get('Records', []):
-        _dispatch(record)
-    return {'processed': len(event.get('Records', []))}
+        guide, genome = _parse_guide(record)
+        key = (str(guide['JobID']), genome)
+        groups.setdefault(key, []).append(guide)
+
+    for (_, genome), guides in groups.items():
+        _dispatch(guides, genome)
+
+    return {
+        'processedGuides': len(event.get('Records', [])),
+        'dispatchedBatches': len(groups),
+    }

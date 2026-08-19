@@ -10,15 +10,21 @@ Mapper path. It intentionally does not implement or invoke the Reducer.
    job payload to the Target Scan queue.
 3. Target Scan keeps its candidate-guide algorithm and existing `sqsIssl`
    message contract.
-4. The Dispatcher consumes each guide and publishes five schema-version 2
-   Mapper tasks, one for every manifest shard.
-5. Each Mapper processes one guide against one shard and writes its partial
-   output to deterministic S3 keys.
+4. The Dispatcher groups the `sqsIssl` records in its Lambda event by job and
+   genome and publishes five schema-version 3 Mapper tasks per group, one for
+   every manifest shard.
+5. Each Mapper processes the group's guide query file against one shard and
+   writes separate partial outputs for every guide to deterministic S3 keys.
 
-SQS delivery is at least once. Dispatcher task IDs and Mapper output keys are
-derived from job ID, target ID, and shard ID, so retries replace the same
-partial result. A Mapper writes `result.json` last and treats a matching marker
-as successful completion on later delivery.
+The `sqsIssl` event source batches up to 10 guide messages. A normal single-job
+batch therefore creates five Mapper invocations instead of 50. Batches that
+contain more than one job or genome are separated before fan-out.
+
+SQS delivery is at least once. Per-guide task IDs and Mapper output keys are
+derived from job ID, target ID, and shard ID, so retries or changed batch
+composition replace the same partial result. A Mapper writes each guide's
+`result.json` last and excludes guides with a matching marker from later batch
+retries.
 
 ## S3 output
 
