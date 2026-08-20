@@ -37,7 +37,6 @@ def _parse_task(record):
         raise ValueError('Mapper task must contain at least one guide')
 
     target_ids = set()
-    guide_sequences = set()
     for guide in task['guides']:
         for field in ('taskId', 'targetId', 'guideSequence', 'output'):
             if field not in guide:
@@ -53,10 +52,7 @@ def _parse_task(record):
         target_id = int(guide['targetId'])
         if target_id in target_ids:
             raise ValueError(f'Duplicate target ID in Mapper batch: {target_id}')
-        if sequence in guide_sequences:
-            raise ValueError(f'Duplicate guide sequence in Mapper batch: {sequence}')
         target_ids.add(target_id)
-        guide_sequences.add(sequence)
         guide['targetId'] = target_id
         guide['guideSequence'] = sequence
     return task
@@ -153,7 +149,7 @@ def _split_results(combined_path, guides, directory):
     signatures = {}
     for guide in guides:
         signature = _sequence_to_signature(guide['guideSequence'])
-        signatures[signature] = guide['targetId']
+        signatures.setdefault(signature, []).append(guide['targetId'])
         results[guide['targetId']] = {
             'mapperRecords': 0,
             'mitRecords': 0,
@@ -184,21 +180,21 @@ def _split_results(combined_path, guides, directory):
                 raise ValueError(
                     f'Mapper returned unknown query signature {query_signature}'
                 )
-            target_id = signatures[query_signature]
-            result = results[target_id]
-            result['mapperRecords'] += 1
-            if offtarget_id == 0xFFFFFFFF:
-                continue
-            if mit_score != 0.0:
-                outputs[target_id]['mit'].write(
-                    SCORE_RESULT.pack(offtarget_id, mit_score)
-                )
-                result['mitRecords'] += 1
-            if cfd_score != 0.0:
-                outputs[target_id]['cfd'].write(
-                    SCORE_RESULT.pack(offtarget_id, cfd_score)
-                )
-                result['cfdRecords'] += 1
+            for target_id in signatures[query_signature]:
+                result = results[target_id]
+                result['mapperRecords'] += 1
+                if offtarget_id == 0xFFFFFFFF:
+                    continue
+                if mit_score != 0.0:
+                    outputs[target_id]['mit'].write(
+                        SCORE_RESULT.pack(offtarget_id, mit_score)
+                    )
+                    result['mitRecords'] += 1
+                if cfd_score != 0.0:
+                    outputs[target_id]['cfd'].write(
+                        SCORE_RESULT.pack(offtarget_id, cfd_score)
+                    )
+                    result['cfdRecords'] += 1
     return results
 
 
