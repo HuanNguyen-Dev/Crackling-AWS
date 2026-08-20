@@ -22,9 +22,9 @@ g++ -o mapper isslScoreOfftargetsMapper.cpp -O3 -std=c++11 -fopenmp -mpopcnt -Ii
 The precompiled `mapper` binary was introduced into this AWS repository in
 commit `e3a35b2` (`Feature: Add memory-aware shard mapper outputs`). Compilation
 was performed outside this repository from the supplied local
-`isslScoreOfftargetsMapper.cpp`; that source directory did not include Git
-metadata identifying a separate compilation-source commit, so no unverifiable
-source revision is claimed here.
+`isslScoreOfftargetsMapper.cpp`; that source directory is: 
+https://github.com/HuanNguyen-Dev/Crackling/commit/7fd6043e1cbe9f322ec3b91c16fac91780bb58b7, 
+in the commit `7fd6043`.
 
 The Mapper's native combined output is an invocation-local intermediate. The
 wrapper streams it into separate compact MIT and CFD objects containing packed
