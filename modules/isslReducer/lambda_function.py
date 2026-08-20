@@ -268,9 +268,12 @@ def _record_pipeline_completion(trigger, scores):
                         'TableName': TASK_TRACKING_TABLE,
                         'Key': {'JobID': {'S': trigger['jobId']}},
                         'UpdateExpression': (
-                            'ADD NumScoredOfftarget :one, Version :one'
+                            'ADD NumScoredOfftarget :one, #version :one'
                         ),
                         'ConditionExpression': 'attribute_exists(JobID)',
+                        'ExpressionAttributeNames': {
+                            '#version': 'Version',
+                        },
                         'ExpressionAttributeValues': {
                             ':one': {'N': '1'},
                         },
