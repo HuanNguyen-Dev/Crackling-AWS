@@ -355,7 +355,7 @@ class CracklingStack(Stack):
             environment={
                 'BUCKET' : s3Genome.bucket_name,
                 'ISSL_QUEUE' : sqsIsslCreation.queue_url,
-                'TARGET_SCAN_QUEUE' : sqsTargetScan.queue_url,
+                'COORDINATOR_QUEUE' : sqsIsslCoordinator.queue_url,
                 'FILE_PARTS_QUEUE' : sqsGenomeParts.queue_url,
                 'LD_LIBRARY_PATH' : ld_library_path,
                 'PATH' : path
@@ -363,7 +363,7 @@ class CracklingStack(Stack):
         )
         ddbJobs.grant_stream_read(lambdaGenomeDownloadScheduler)
         sqsIsslCreation.grant_send_messages(lambdaGenomeDownloadScheduler)
-        sqsTargetScan.grant_send_messages(lambdaGenomeDownloadScheduler)
+        sqsIsslCoordinator.grant_send_messages(lambdaGenomeDownloadScheduler)
         sqsGenomeParts.grant_send_messages(lambdaGenomeDownloadScheduler)
 
         lambdaGenomeDownloadScheduler.add_event_source_mapping(
