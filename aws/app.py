@@ -296,6 +296,15 @@ class CracklingStack(Stack):
             visibility_timeout=duration,
             retention_period=Duration.days(4)
         )
+
+        ### Buffer Mapper completion events before reduction.
+        # Reducer concurrency is bounded on the Lambda so bursts do not create
+        # excessive contention on the shared TaskTracking DynamoDB item.
+        sqsIsslReducer = sqs_.Queue(self, "sqsIsslReducer",
+            receive_message_wait_time=Duration.seconds(20),
+            visibility_timeout=duration,
+            retention_period=Duration.days(4)
+        )
         
         ### SQS queue for evaluating guide efficiency
         # The TargetScan lambda function adds guides to this queue for processing
@@ -590,6 +599,7 @@ class CracklingStack(Stack):
             vpc_subnets=ec2_.SubnetSelection(subnet_type=ec2_.SubnetType.PRIVATE_ISOLATED),
             timeout=duration,
             memory_size=4096,
+            reserved_concurrent_executions=50,
             ephemeral_storage_size=cdk.Size.gibibytes(10),
             environment={
                 'TARGETS_TABLE': ddbTargets.table_name,
@@ -598,6 +608,12 @@ class CracklingStack(Stack):
             }
         )
         lambdaIsslReducer.add_to_role_policy(policyAccessS3GenomeBucket)
+        sqsIsslReducer.grant_consume_messages(lambdaIsslReducer)
+        lambdaIsslReducer.add_event_source_mapping(
+            "mapLdaIsslSqsReducer",
+            event_source_arn=sqsIsslReducer.queue_arn,
+            batch_size=1
+        )
         ddbTargets.grant_read_write_data(lambdaIsslReducer)
         ddbTaskTracking.grant_read_write_data(lambdaIsslReducer)
         lambdaIsslReducer.add_to_role_policy(iam_.PolicyStatement(
@@ -606,7 +622,7 @@ class CracklingStack(Stack):
         ))
         s3Genome.add_event_notification(
             s3_.EventType.OBJECT_CREATED,
-            s3n_.LambdaDestination(lambdaIsslReducer),
+            s3n_.SqsDestination(sqsIsslReducer),
             s3_.NotificationKeyFilter(suffix='result.json')
         )
 

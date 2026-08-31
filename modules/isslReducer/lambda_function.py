@@ -1,10 +1,12 @@
 import json
 import math
 import os
+import random
 import re
 import sqlite3
 import struct
 import tempfile
+import time
 from urllib.parse import unquote_plus
 
 import boto3
@@ -12,6 +14,9 @@ from botocore.exceptions import ClientError
 
 
 SHARD_COUNT = int(os.getenv('SHARD_COUNT', '5'))
+TRANSACTION_MAX_ATTEMPTS = 5
+TRANSACTION_BACKOFF_BASE_SECONDS = 0.05
+TRANSACTION_BACKOFF_MAX_SECONDS = 1.0
 TARGETS_TABLE = os.getenv('TARGETS_TABLE')
 TASK_TRACKING_TABLE = os.getenv('TASK_TRACKING_TABLE')
 SCORE_RECORD = struct.Struct('<Id')
@@ -39,6 +44,16 @@ def _mapper_event(record):
         'targetId': int(values['target_id']),
         'shardId': int(values['shard_id']),
     }
+
+
+def _s3_records(record):
+    """Return S3 event records from either direct S3 or SQS delivery."""
+    if 's3' in record:
+        return [record]
+    if record.get('eventSource') != 'aws:sqs':
+        return []
+    message = json.loads(record['body'])
+    return message.get('Records', [])
 
 
 def _get_json(bucket, key, missing_is_none=False):
@@ -238,8 +253,9 @@ def _record_pipeline_completion(trigger, scores):
         raise ValueError('Reducer DynamoDB table environment is not configured')
 
     completion_id = _completion_id(trigger)
-    try:
-        dynamodb_client.transact_write_items(
+    for attempt in range(TRANSACTION_MAX_ATTEMPTS):
+        try:
+            dynamodb_client.transact_write_items(
             TransactItems=[
                 {
                     'Update': {
@@ -280,61 +296,86 @@ def _record_pipeline_completion(trigger, scores):
                     },
                 },
             ],
-        )
-        return True
-    except ClientError as error:
-        if error.response.get('Error', {}).get('Code') != 'TransactionCanceledException':
-            raise
+            )
+            return True
+        except ClientError as error:
+            if error.response.get('Error', {}).get('Code') != 'TransactionCanceledException':
+                raise
 
-        target = dynamodb_client.get_item(
-            TableName=TARGETS_TABLE,
-            Key={
-                'JobID': {'S': trigger['jobId']},
-                'TargetID': {'N': str(trigger['targetId'])},
-            },
-            ConsistentRead=True,
-        ).get('Item', {})
-        recorded_id = target.get('ReducerTaskId', {}).get('S')
-        if recorded_id == completion_id:
-            return False
-        raise
+            cancellation_reasons = error.response.get('CancellationReasons', [])
+            has_conflict = any(
+                reason.get('Code') == 'TransactionConflict'
+                for reason in cancellation_reasons
+            )
+            if has_conflict and attempt + 1 < TRANSACTION_MAX_ATTEMPTS:
+                delay = random.uniform(
+                    0,
+                    min(
+                        TRANSACTION_BACKOFF_MAX_SECONDS,
+                        TRANSACTION_BACKOFF_BASE_SECONDS * (2 ** attempt),
+                    ),
+                )
+                print(json.dumps({
+                    'event': 'reducer_transaction_conflict',
+                    'jobId': trigger['jobId'],
+                    'targetId': trigger['targetId'],
+                    'attempt': attempt + 1,
+                    'retryDelaySeconds': delay,
+                    'cancellationReasons': cancellation_reasons,
+                }))
+                time.sleep(delay)
+                continue
+
+            target = dynamodb_client.get_item(
+                TableName=TARGETS_TABLE,
+                Key={
+                    'JobID': {'S': trigger['jobId']},
+                    'TargetID': {'N': str(trigger['targetId'])},
+                },
+                ConsistentRead=True,
+            ).get('Item', {})
+            recorded_id = target.get('ReducerTaskId', {}).get('S')
+            if recorded_id == completion_id:
+                return False
+            raise
 
 
 def lambda_handler(event, context):
     processed = 0
     waiting = 0
     ignored = 0
-    for record in event.get('Records', []):
-        trigger = _mapper_event(record)
-        if trigger is None:
-            ignored += 1
-            continue
-        markers = _load_all_markers(trigger)
-        if markers is None:
-            waiting += 1
-            continue
-        keys = _result_keys(trigger)
-        existing_result = _get_json(
-            trigger['bucket'], keys['result'], missing_is_none=True,
-        )
-        if existing_result is not None:
-            processed += 1
-            continue
+    for envelope in event.get('Records', []):
+        for record in _s3_records(envelope):
+            trigger = _mapper_event(record)
+            if trigger is None:
+                ignored += 1
+                continue
+            markers = _load_all_markers(trigger)
+            if markers is None:
+                waiting += 1
+                continue
+            keys = _result_keys(trigger)
+            existing_result = _get_json(
+                trigger['bucket'], keys['result'], missing_is_none=True,
+            )
+            if existing_result is not None:
+                processed += 1
+                continue
 
-        result, keys = _reduce(trigger, markers)
-        pipeline_updated = _record_pipeline_completion(
-            trigger, result['scores'],
-        )
-        result['pipelineStatus'] = 'complete'
-        # The final marker is written only after both score objects and the
-        # existing DynamoDB completion pipeline have succeeded.
-        _write_json(trigger['bucket'], keys['result'], result)
-        processed += 1
-        print(json.dumps({
-            'event': 'reducer_complete',
-            'jobId': trigger['jobId'],
-            'targetId': trigger['targetId'],
-            'scores': result['scores'],
-            'pipelineUpdated': pipeline_updated,
-        }))
+            result, keys = _reduce(trigger, markers)
+            pipeline_updated = _record_pipeline_completion(
+                trigger, result['scores'],
+            )
+            result['pipelineStatus'] = 'complete'
+            # The final marker is written only after both score objects and the
+            # existing DynamoDB completion pipeline have succeeded.
+            _write_json(trigger['bucket'], keys['result'], result)
+            processed += 1
+            print(json.dumps({
+                'event': 'reducer_complete',
+                'jobId': trigger['jobId'],
+                'targetId': trigger['targetId'],
+                'scores': result['scores'],
+                'pipelineUpdated': pipeline_updated,
+            }))
     return {'processed': processed, 'waiting': waiting, 'ignored': ignored}
