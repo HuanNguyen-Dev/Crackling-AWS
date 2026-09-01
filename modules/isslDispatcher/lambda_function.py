@@ -66,7 +66,7 @@ def _guide_contract(guide, genome, shard_id):
             'prefix': output_prefix,
             'mitKey': f'{output_prefix}/mit.bin',
             'cfdKey': f'{output_prefix}/cfd.bin',
-            'metadataKey': f'{output_prefix}/result.json',
+            'metadataKey': f'{output_prefix}/mapper-result.json',
         },
     }
 

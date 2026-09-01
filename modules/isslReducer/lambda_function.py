@@ -22,7 +22,7 @@ TASK_TRACKING_TABLE = os.getenv('TASK_TRACKING_TABLE')
 SCORE_RECORD = struct.Struct('<Id')
 MAPPER_MARKER_PATTERN = re.compile(
     r'^(?P<genome>.+)/mapper/(?P<job_id>[^/]+)/targets/'
-    r'(?P<target_id>\d+)/shards/(?P<shard_id>\d+)/result\.json$'
+    r'(?P<target_id>\d+)/shards/(?P<shard_id>\d+)/mapper-result\.json$'
 )
 
 s3_client = boto3.client('s3')
@@ -70,7 +70,7 @@ def _get_json(bucket, key, missing_is_none=False):
 def _marker_key(trigger, shard_id):
     return (
         f'{trigger["genome"]}/mapper/{trigger["jobId"]}/targets/'
-        f'{trigger["targetId"]}/shards/{shard_id}/result.json'
+        f'{trigger["targetId"]}/shards/{shard_id}/mapper-result.json'
     )
 
 
@@ -340,42 +340,57 @@ def _record_pipeline_completion(trigger, scores):
             raise
 
 
-def lambda_handler(event, context):
-    processed = 0
-    waiting = 0
-    ignored = 0
-    for envelope in event.get('Records', []):
-        for record in _s3_records(envelope):
-            trigger = _mapper_event(record)
-            if trigger is None:
-                ignored += 1
-                continue
-            markers = _load_all_markers(trigger)
-            if markers is None:
-                waiting += 1
-                continue
-            keys = _result_keys(trigger)
-            existing_result = _get_json(
-                trigger['bucket'], keys['result'], missing_is_none=True,
-            )
-            if existing_result is not None:
-                processed += 1
-                continue
+def _process_s3_record(record):
+    trigger = _mapper_event(record)
+    if trigger is None:
+        return 'ignored'
+    markers = _load_all_markers(trigger)
+    if markers is None:
+        return 'waiting'
+    keys = _result_keys(trigger)
+    existing_result = _get_json(
+        trigger['bucket'], keys['result'], missing_is_none=True,
+    )
+    if existing_result is not None:
+        return 'processed'
 
-            result, keys = _reduce(trigger, markers)
-            pipeline_updated = _record_pipeline_completion(
-                trigger, result['scores'],
-            )
-            result['pipelineStatus'] = 'complete'
-            # The final marker is written only after both score objects and the
-            # existing DynamoDB completion pipeline have succeeded.
-            _write_json(trigger['bucket'], keys['result'], result)
-            processed += 1
+    result, keys = _reduce(trigger, markers)
+    pipeline_updated = _record_pipeline_completion(
+        trigger, result['scores'],
+    )
+    result['pipelineStatus'] = 'complete'
+    # The final marker is written only after both score objects and the
+    # existing DynamoDB completion pipeline have succeeded.
+    _write_json(trigger['bucket'], keys['result'], result)
+    print(json.dumps({
+        'event': 'reducer_complete',
+        'jobId': trigger['jobId'],
+        'targetId': trigger['targetId'],
+        'scores': result['scores'],
+        'pipelineUpdated': pipeline_updated,
+    }))
+    return 'processed'
+
+
+def lambda_handler(event, context):
+    counts = {'processed': 0, 'waiting': 0, 'ignored': 0}
+    batch_item_failures = []
+    for envelope in event.get('Records', []):
+        try:
+            for record in _s3_records(envelope):
+                outcome = _process_s3_record(record)
+                counts[outcome] += 1
+        except Exception as error:
+            message_id = envelope.get('messageId')
+            if message_id is None:
+                raise
             print(json.dumps({
-                'event': 'reducer_complete',
-                'jobId': trigger['jobId'],
-                'targetId': trigger['targetId'],
-                'scores': result['scores'],
-                'pipelineUpdated': pipeline_updated,
+                'event': 'reducer_message_failed',
+                'messageId': message_id,
+                'errorType': type(error).__name__,
+                'error': str(error),
             }))
-    return {'processed': processed, 'waiting': waiting, 'ignored': ignored}
+            batch_item_failures.append({'itemIdentifier': message_id})
+
+    counts['batchItemFailures'] = batch_item_failures
+    return counts

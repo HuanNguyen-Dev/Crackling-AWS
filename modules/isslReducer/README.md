@@ -1,7 +1,7 @@
 # ISSL Reducer Lambda
 
 The Reducer completes Stage 3 of the distributed off-target scoring path. S3
-invokes it whenever an object ending in `result.json` is created. Only Mapper
+invokes it whenever an object ending in `mapper-result.json` is created. Only Mapper
 completion keys matching the expected job, target, and shard structure are
 processed; Reducer completion events and unrelated objects are ignored.
 
@@ -10,9 +10,9 @@ processed; Reducer completion events and unrelated objects are ignored.
 For each candidate guide, the Reducer checks for all five Mapper markers:
 
 ```text
-<genome>/mapper/<job-id>/targets/<target-id>/shards/0/result.json
+<genome>/mapper/<job-id>/targets/<target-id>/shards/0/mapper-result.json
 ...
-<genome>/mapper/<job-id>/targets/<target-id>/shards/4/result.json
+<genome>/mapper/<job-id>/targets/<target-id>/shards/4/mapper-result.json
 ```
 
 An invocation exits successfully when any marker is still absent. S3 invokes

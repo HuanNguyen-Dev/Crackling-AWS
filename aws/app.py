@@ -612,7 +612,8 @@ class CracklingStack(Stack):
         lambdaIsslReducer.add_event_source_mapping(
             "mapLdaIsslSqsReducer",
             event_source_arn=sqsIsslReducer.queue_arn,
-            batch_size=1
+            batch_size=10,
+            report_batch_item_failures=True
         )
         ddbTargets.grant_read_write_data(lambdaIsslReducer)
         ddbTaskTracking.grant_read_write_data(lambdaIsslReducer)
@@ -623,7 +624,7 @@ class CracklingStack(Stack):
         s3Genome.add_event_notification(
             s3_.EventType.OBJECT_CREATED,
             s3n_.SqsDestination(sqsIsslReducer),
-            s3_.NotificationKeyFilter(suffix='result.json')
+            s3_.NotificationKeyFilter(suffix='mapper-result.json')
         )
 
         cdk.CfnOutput(
