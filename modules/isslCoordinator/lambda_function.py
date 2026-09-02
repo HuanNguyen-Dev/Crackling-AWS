@@ -14,6 +14,7 @@ ISSL_HEADER_BYTES = ISSL_HEADER_FIELDS * SIZE_T_BYTES
 BUCKET = os.environ['BUCKET']
 TARGET_SCAN_QUEUE_URL = os.environ['TARGET_SCAN_QUEUE']
 NUM_SHARDS = int(os.getenv('NUM_SHARDS', '5'))
+MAX_DISTANCE = int(os.getenv('MAX_DISTANCE', '4'))
 s3_client = boto3.client('s3')
 sqs_client = boto3.client('sqs')
 
@@ -50,11 +51,13 @@ def _read_issl_layout(key):
         scores_count,
     ) = struct.unpack('<6Q', header_data)
 
-    if slice_count < NUM_SHARDS:
+    if slice_count != NUM_SHARDS:
         raise ValueError(
-            f'ISSL contains {slice_count} slices; Stage 1 requires exactly '
-            f'{NUM_SHARDS} non-empty shards'
+            f'ISSL contains {slice_count} slices; bucket-level scoring '
+            f'requires exactly {NUM_SHARDS}'
         )
+    if MAX_DISTANCE != 4:
+        raise ValueError('Bucket-level scoring requires MAX_DISTANCE=4')
 
     slice_limit = 1 << slice_width
     slicelist_size_count = slice_count * slice_limit
@@ -91,35 +94,20 @@ def _read_issl_layout(key):
 def _calculate_shards(layout):
     slice_count = layout['sliceCount']
     slice_limit = layout['sliceLimit']
-    required_boundaries = {
-        ((shard * slice_count) // NUM_SHARDS) * slice_limit
-        for shard in range(NUM_SHARDS + 1)
-    }
-
-    cumulative_bytes = {}
-    running_bytes = 0
-    for index, bucket_size in enumerate(layout['slicelistSizes']):
-        if index in required_boundaries:
-            cumulative_bytes[index] = running_bytes
-        running_bytes += bucket_size * UINT64_BYTES
-    cumulative_bytes[len(layout['slicelistSizes'])] = running_bytes
-
+    running_byte = layout['baseOffsetBytes']
     shards = []
     for shard_id in range(NUM_SHARDS):
-        start_slice = (shard_id * slice_count) // NUM_SHARDS
-        end_slice = ((shard_id + 1) * slice_count) // NUM_SHARDS
+        bucket_offsets = [running_byte]
+        first_bucket = shard_id * slice_limit
+        for bucket_size in layout['slicelistSizes'][
+            first_bucket:first_bucket + slice_limit
+        ]:
+            running_byte += bucket_size * UINT64_BYTES
+            bucket_offsets.append(running_byte)
         shards.append({
             'shardId': shard_id,
-            'startSlice': start_slice,
-            'endSlice': end_slice,
-            'startByte': (
-                layout['baseOffsetBytes']
-                + cumulative_bytes[start_slice * slice_limit]
-            ),
-            'endByte': (
-                layout['baseOffsetBytes']
-                + cumulative_bytes[end_slice * slice_limit]
-            ),
+            'sliceId': shard_id,
+            'bucketOffsets': bucket_offsets,
         })
     return shards
 
@@ -144,9 +132,10 @@ def _process_job(message):
     layout = _read_issl_layout(issl_key)
     shards = _calculate_shards(layout)
     audit_document = {
-        'schemaVersion': 1,
+        'schemaVersion': 2,
         'jobId': job_id,
         'genome': genome,
+        'maxDistance': MAX_DISTANCE,
         'issl': {'bucket': BUCKET, 'key': issl_key},
         'layout': {
             key: value
