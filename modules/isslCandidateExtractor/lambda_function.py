@@ -44,10 +44,22 @@ def _process(task):
         bucket_file = os.path.join(directory, 'bucket.bin')
         output_file = os.path.join(directory, 'candidates.bin')
         _range(task['catalogue'], catalogue)
+        catalogue_bytes = os.path.getsize(catalogue)
+        total_bucket_bytes = 0
+        total_output_bytes = 0
+        peak_local_bytes = catalogue_bytes
+        previous_output_bytes = 0
         for bucket in task['buckets']:
             _range({'bucket': task['catalogue'].get('bucket', BUCKET),
                     'key': task['catalogue']['key'],
                     'startByte': bucket['startByte'], 'endByte': bucket['endByte']}, bucket_file)
+            bucket_bytes = os.path.getsize(bucket_file)
+            # The preceding output remains on /tmp until the native process
+            # truncates it, so include that short overlap in the observed peak.
+            peak_local_bytes = max(
+                peak_local_bytes,
+                catalogue_bytes + bucket_bytes + previous_output_bytes,
+            )
             completed = subprocess.run([
                 BINARY, catalogue, bucket_file,
                 str(task['idRange']['start']), str(task['idRange']['end']), output_file,
@@ -60,6 +72,22 @@ def _process(task):
             key = (f'{bucket["cachePrefix"]}/parts/'
                    f'{task["idRange"]["start"]}-{task["idRange"]["end"]}.bin')
             count = size // 16
+            total_bucket_bytes += bucket_bytes
+            total_output_bytes += size
+            local_bytes = catalogue_bytes + bucket_bytes + size
+            peak_local_bytes = max(peak_local_bytes, local_bytes)
+            previous_output_bytes = size
+            print(json.dumps({
+                'event': 'extractor_bucket_sizes',
+                'batchId': task['batchId'],
+                'partId': task['partId'],
+                'sliceId': bucket['sliceId'],
+                'bucketId': bucket['bucketId'],
+                'catalogueBytes': catalogue_bytes,
+                'bucketBytes': bucket_bytes,
+                'hydratedOutputBytes': size,
+                'localBytes': local_bytes,
+            }))
             if count:
                 s3.upload_file(output_file, BUCKET, key,
                                ExtraArgs={'ContentType': 'application/octet-stream'})
@@ -67,6 +95,16 @@ def _process(task):
                             'manifestKey': bucket['manifestKey'], 'key': key if count else None,
                             'startId': task['idRange']['start'], 'endId': task['idRange']['end'],
                             'recordCount': count, 'recordBytes': 16})
+        print(json.dumps({
+            'event': 'extractor_part_sizes',
+            'batchId': task['batchId'],
+            'partId': task['partId'],
+            'expectedParts': task['expectedParts'],
+            'catalogueBytes': catalogue_bytes,
+            'bucketBytesProcessed': total_bucket_bytes,
+            'hydratedOutputBytes': total_output_bytes,
+            'peakLocalBytes': peak_local_bytes,
+        }))
     marker_key = f'{task["completionPrefix"]}/{task["partId"]}/result.json'
     marker = {'schemaVersion': 1, 'batchId': task['batchId'], 'partId': task['partId'],
               'expectedParts': task['expectedParts'], 'buckets': records}

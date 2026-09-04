@@ -10,7 +10,8 @@ BUCKET = os.environ['BUCKET']
 MAPPER_QUEUE = os.environ['MAPPER_QUEUE']
 EXTRACTOR_QUEUE = os.environ['EXTRACTOR_QUEUE']
 SHARD_COUNT = int(os.getenv('NUM_SHARDS', '5'))
-EXTRACTOR_COUNT = int(os.getenv('EXTRACTOR_COUNT', '5'))
+MAX_EXTRACTORS = int(os.getenv('MAX_EXTRACTORS', '50'))
+EXTRACTOR_SAFE_BYTES = int(os.getenv('EXTRACTOR_SAFE_BYTES', str(8 * 1024 ** 3)))
 MAX_GUIDES = int(os.getenv('MAX_GUIDES_PER_GROUP', '5'))
 MAX_DISTANCE = int(os.getenv('MAX_DISTANCE', '4'))
 SCORE_THRESHOLD = float(os.getenv('SCORE_THRESHOLD', '75'))
@@ -18,8 +19,12 @@ SCORE_METHOD = os.getenv('SCORE_METHOD', 'and')
 s3 = boto3.client('s3')
 sqs = boto3.client('sqs')
 
-if EXTRACTOR_COUNT < 1 or MAX_GUIDES < 1:
-    raise ValueError('Extractor count and maximum guide batch size must be positive')
+CATALOGUE_RECORD_BYTES = 8
+RAW_BUCKET_RECORD_BYTES = 8
+HYDRATED_RECORD_BYTES = 16
+
+if MAX_EXTRACTORS < 1 or EXTRACTOR_SAFE_BYTES < 1 or MAX_GUIDES < 1:
+    raise ValueError('Extractor limits and maximum guide batch size must be positive')
 
 
 def _json(key):
@@ -33,6 +38,99 @@ def _json(key):
 
 def _hash(*parts):
     return hashlib.sha256(':'.join(map(str, parts)).encode()).hexdigest()
+
+
+def _ceil_div(numerator, denominator):
+    return (numerator + denominator - 1) // denominator
+
+
+def _largest_manifest_bucket(manifest):
+    largest = 0
+    for shard in manifest['shards']:
+        offsets = [int(value) for value in shard['bucketOffsets']]
+        if any(end < start for start, end in zip(offsets, offsets[1:])):
+            raise ValueError('ISSL bucket offsets must be monotonic')
+        for start, end in zip(offsets, offsets[1:]):
+            largest = max(largest, end - start)
+    return largest
+
+
+def _extractor_allocation(manifest):
+    """Choose stable ID partitions using immutable, whole-ISSL metadata."""
+    offtarget_count = int(manifest['layout']['offtargetsCount'])
+    if not 0 <= offtarget_count <= 0xffffffff:
+        raise ValueError('ISSL off-target count does not fit the uint32 extractor contract')
+    catalogue_bytes = offtarget_count * CATALOGUE_RECORD_BYTES
+    largest_bucket_bytes = _largest_manifest_bucket(manifest)
+    # One raw 8-byte record produces at most one hydrated 16-byte record.
+    irreducible_bytes = largest_bucket_bytes * (
+        1 + HYDRATED_RECORD_BYTES // RAW_BUCKET_RECORD_BYTES
+    )
+    available_catalogue_bytes = EXTRACTOR_SAFE_BYTES - irreducible_bytes
+    if available_catalogue_bytes < CATALOGUE_RECORD_BYTES:
+        required = MAX_EXTRACTORS + 1
+    else:
+        records_per_extractor = available_catalogue_bytes // CATALOGUE_RECORD_BYTES
+        required = max(1, _ceil_div(offtarget_count, records_per_extractor))
+    extractor_count = min(required, MAX_EXTRACTORS)
+    if offtarget_count:
+        extractor_count = min(extractor_count, offtarget_count)
+    return {
+        'extractorCount': max(1, extractor_count),
+        'requiredExtractors': required,
+        'offtargetsCount': offtarget_count,
+        'catalogueBytes': catalogue_bytes,
+        'largestIsslBucketBytes': largest_bucket_bytes,
+    }
+
+
+def _check_selected_bucket_feasibility(missing, allocation):
+    largest = max(
+        (int(bucket['endByte']) - int(bucket['startByte']) for bucket in missing),
+        default=0,
+    )
+    extractor_count = allocation['extractorCount']
+    catalogue_part_bytes = (
+        _ceil_div(allocation['offtargetsCount'], extractor_count)
+        * CATALOGUE_RECORD_BYTES
+    )
+    maximum_output_bytes = largest * (
+        HYDRATED_RECORD_BYTES // RAW_BUCKET_RECORD_BYTES
+    )
+    estimated_peak_bytes = (
+        catalogue_part_bytes + largest + maximum_output_bytes
+    )
+    details = {
+        'extractorCount': extractor_count,
+        'requiredExtractors': allocation['requiredExtractors'],
+        'offtargetsCount': allocation['offtargetsCount'],
+        'catalogueBytes': allocation['catalogueBytes'],
+        'catalogueBytesPerExtractor': catalogue_part_bytes,
+        'largestIsslBucketBytes': allocation['largestIsslBucketBytes'],
+        'largestSelectedBucketBytes': largest,
+        'maximumHydratedOutputBytes': maximum_output_bytes,
+        'estimatedPeakBytesPerExtractor': estimated_peak_bytes,
+        'safeLimitBytes': EXTRACTOR_SAFE_BYTES,
+        'maxExtractors': MAX_EXTRACTORS,
+    }
+    if estimated_peak_bytes < EXTRACTOR_SAFE_BYTES:
+        print(json.dumps({'event': 'extractor_allocation', **details}))
+        return
+
+    reason = (
+        'BUCKET_EXCEEDS_LAMBDA_LIMIT'
+        if largest + maximum_output_bytes >= EXTRACTOR_SAFE_BYTES
+        else 'RETRY_WITH_MORE_EXTRACTORS'
+    )
+    print(json.dumps({
+        'event': 'extractor_feasibility_failure',
+        'reason': reason,
+        **details,
+    }))
+    raise ValueError(
+        f'{reason}: estimated extractor peak {estimated_peak_bytes} bytes '
+        f'is not below safe limit {EXTRACTOR_SAFE_BYTES} bytes'
+    )
 
 
 def _signature(sequence):
@@ -186,11 +284,14 @@ def _dispatch_group(guides, genome, manifest):
         _send(MAPPER_QUEUE, mapper_tasks)
         return
 
+    allocation = _extractor_allocation(manifest)
+    _check_selected_bucket_feasibility(missing, allocation)
+    extractor_count = allocation['extractorCount']
     job_id = str(guides[0]['JobID'])
     batch_id = _hash(
         job_id,
         *(int(g['TargetID']) for g in guides),
-        f'extractors={EXTRACTOR_COUNT}',
+        f'extractors={extractor_count}',
     )
     prefix = f'{genome}/issl/extractions/{job_id}/{batch_id}'
     batch_key = f'{prefix}/batch.json'
@@ -198,7 +299,7 @@ def _dispatch_group(guides, genome, manifest):
     batch = {
         'schemaVersion': 1,
         'batchId': batch_id,
-        'expectedParts': EXTRACTOR_COUNT,
+        'expectedParts': extractor_count,
         'offtargetsCount': count,
         'missingBuckets': missing,
         'mapperTasks': mapper_tasks,
@@ -208,12 +309,12 @@ def _dispatch_group(guides, genome, manifest):
                   ContentType='application/json')
     catalogue_start = 48 + int(manifest['layout']['scoresCount']) * 16
     tasks = []
-    for part_id in range(EXTRACTOR_COUNT):
-        start_id = part_id * count // EXTRACTOR_COUNT
-        end_id = (part_id + 1) * count // EXTRACTOR_COUNT
+    for part_id in range(extractor_count):
+        start_id = part_id * count // extractor_count
+        end_id = (part_id + 1) * count // extractor_count
         tasks.append({
             'schemaVersion': 1, 'batchId': batch_id, 'batchKey': batch_key,
-            'partId': part_id, 'expectedParts': EXTRACTOR_COUNT,
+            'partId': part_id, 'expectedParts': extractor_count,
             'idRange': {'start': start_id, 'end': end_id},
             'catalogue': {
                 'bucket': manifest['issl']['bucket'],
