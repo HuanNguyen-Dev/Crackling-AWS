@@ -135,13 +135,22 @@ def _partition_guides(guides, manifest):
         # that common case, and fall back to deterministic chunks if the event
         # source batch is increased substantially in the future.
         if len(remaining) <= MAX_GUIDES * 2 and len(remaining) <= 20:
-            first_size = min(MAX_GUIDES, len(remaining) - 1)
             candidates = []
-            for tail in itertools.combinations(range(1, len(remaining)), first_size - 1):
-                indexes = {0, *tail}
-                first = [item for index, item in enumerate(remaining) if index in indexes]
-                second = [item for index, item in enumerate(remaining) if index not in indexes]
-                if len(second) <= MAX_GUIDES:
+            for first_size in range(1, MAX_GUIDES + 1):
+                second_size = len(remaining) - first_size
+                if not 1 <= second_size <= MAX_GUIDES:
+                    continue
+                for tail in itertools.combinations(
+                        range(1, len(remaining)), first_size - 1):
+                    indexes = {0, *tail}
+                    first = [
+                        item for index, item in enumerate(remaining)
+                        if index in indexes
+                    ]
+                    second = [
+                        item for index, item in enumerate(remaining)
+                        if index not in indexes
+                    ]
                     tie = tuple(int(item['TargetID']) for item in first)
                     candidates.append((max(_group_bytes(first, manifest),
                                            _group_bytes(second, manifest)), tie,
