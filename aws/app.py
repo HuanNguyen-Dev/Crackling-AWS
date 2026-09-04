@@ -191,6 +191,13 @@ class CracklingStack(Stack):
             compatible_architectures=[lambda_.Architecture.X86_64]
         )
 
+        lambdaLayerIsslCandidateExtractor = lambda_.LayerVersion(
+            self, "lambdaLayerIsslCandidateExtractor",
+            code=lambda_.Code.from_asset("../layers/isslCandidateExtractor"),
+            removal_policy=RemovalPolicy.DESTROY,
+            compatible_architectures=[lambda_.Architecture.X86_64]
+        )
+
         ### Lambda layer containing python3.10 packages for requests
         lambdaLayerRequests = lambda_.LayerVersion(self, "lambdaLayerRequests",
             code=lambda_.Code.from_asset("../layers/requestsPy310Pkgs"),
@@ -292,6 +299,19 @@ class CracklingStack(Stack):
 
         ### Internal queue containing one guide-batch task per ISSL shard.
         sqsIsslMapper = sqs_.Queue(self, "sqsIsslMapper",
+            receive_message_wait_time=Duration.seconds(20),
+            visibility_timeout=duration,
+            retention_period=Duration.days(4)
+        )
+
+        sqsIsslCandidateExtractor = sqs_.Queue(
+            self, "sqsIsslCandidateExtractor",
+            receive_message_wait_time=Duration.seconds(20),
+            visibility_timeout=duration,
+            retention_period=Duration.days(4)
+        )
+        sqsIsslExtractionCompletion = sqs_.Queue(
+            self, "sqsIsslExtractionCompletion",
             receive_message_wait_time=Duration.seconds(20),
             visibility_timeout=duration,
             retention_period=Duration.days(4)
@@ -522,7 +542,11 @@ class CracklingStack(Stack):
             environment={
                 'BUCKET' : s3GenomeAccess.attr_alias,
                 'MAPPER_QUEUE': sqsIsslMapper.queue_url,
+                'EXTRACTOR_QUEUE': sqsIsslCandidateExtractor.queue_url,
                 'NUM_SHARDS': '5',
+                'MAX_EXTRACTORS': '50',
+                'EXTRACTOR_SAFE_BYTES': str(8 * 1024 ** 3),
+                'MAX_GUIDES_PER_GROUP': '5',
                 'MAX_DISTANCE': '4',
                 'SCORE_THRESHOLD': '75',
                 'SCORE_METHOD': 'and'
@@ -530,6 +554,7 @@ class CracklingStack(Stack):
         )
         sqsIssl.grant_consume_messages(lambdaIsslDispatcher)
         sqsIsslMapper.grant_send_messages(lambdaIsslDispatcher)
+        sqsIsslCandidateExtractor.grant_send_messages(lambdaIsslDispatcher)
         lambdaIsslDispatcher.add_event_source_mapping(
             "mapLdaIsslSqsIssl",
             event_source_arn=sqsIssl.queue_arn,
@@ -537,6 +562,56 @@ class CracklingStack(Stack):
             max_batching_window=Duration.seconds(5)
         )
         lambdaIsslDispatcher.add_to_role_policy(policyAccessS3GenomeBucket)
+
+        lambdaIsslCandidateExtractor = lambda_.Function(
+            self, "lambdaIsslCandidateExtractor",
+            runtime=lambda_.Runtime.PYTHON_3_10,
+            handler="lambda_function.lambda_handler",
+            code=lambda_.Code.from_asset("../modules/isslCandidateExtractor"),
+            layers=[lambdaLayerIsslCandidateExtractor, lambdaLayerLib],
+            vpc=cracklingVpc,
+            vpc_subnets=ec2_.SubnetSelection(subnet_type=ec2_.SubnetType.PRIVATE_ISOLATED),
+            timeout=duration,
+            memory_size=10240,
+            ephemeral_storage_size=cdk.Size.gibibytes(10),
+            environment={
+                'BUCKET': s3GenomeAccess.attr_alias,
+                'COMPLETION_QUEUE': sqsIsslExtractionCompletion.queue_url,
+                'LD_LIBRARY_PATH': ld_library_path
+            }
+        )
+        sqsIsslCandidateExtractor.grant_consume_messages(lambdaIsslCandidateExtractor)
+        sqsIsslExtractionCompletion.grant_send_messages(lambdaIsslCandidateExtractor)
+        lambdaIsslCandidateExtractor.add_event_source_mapping(
+            "mapLdaIsslSqsCandidateExtractor",
+            event_source_arn=sqsIsslCandidateExtractor.queue_arn,
+            batch_size=1
+        )
+        lambdaIsslCandidateExtractor.add_to_role_policy(policyAccessS3GenomeBucket)
+
+        lambdaIsslExtractionCompletion = lambda_.Function(
+            self, "lambdaIsslExtractionCompletion",
+            runtime=lambda_.Runtime.PYTHON_3_10,
+            handler="lambda_function.lambda_handler",
+            code=lambda_.Code.from_asset("../modules/isslExtractionCompletion"),
+            vpc=cracklingVpc,
+            vpc_subnets=ec2_.SubnetSelection(subnet_type=ec2_.SubnetType.PRIVATE_ISOLATED),
+            timeout=duration,
+            memory_size=1024,
+            environment={
+                'BUCKET': s3GenomeAccess.attr_alias,
+                'MAPPER_QUEUE': sqsIsslMapper.queue_url
+            }
+        )
+        sqsIsslExtractionCompletion.grant_consume_messages(lambdaIsslExtractionCompletion)
+        sqsIsslMapper.grant_send_messages(lambdaIsslExtractionCompletion)
+        lambdaIsslExtractionCompletion.add_event_source_mapping(
+            "mapLdaIsslSqsExtractionCompletion",
+            event_source_arn=sqsIsslExtractionCompletion.queue_arn,
+            batch_size=5,
+            max_batching_window=Duration.seconds(5)
+        )
+        lambdaIsslExtractionCompletion.add_to_role_policy(policyAccessS3GenomeBucket)
 
         ### Coordinator for distributed off-target scoring. Target Scan is
         # released only after the five-shard manifest has been persisted.
@@ -577,7 +652,8 @@ class CracklingStack(Stack):
             ephemeral_storage_size=cdk.Size.gibibytes(10),
             environment={
                 'LD_LIBRARY_PATH': ld_library_path,
-                'OMP_NUM_THREADS': '6'
+                'OMP_NUM_THREADS': '6',
+                'MAX_GUIDES_PER_GROUP': '5'
             }
         )
         sqsIsslMapper.grant_consume_messages(lambdaIsslMapper)

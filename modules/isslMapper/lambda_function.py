@@ -13,8 +13,7 @@ from botocore.exceptions import ClientError
 MAPPER_BINARY_SOURCE = '/opt/mapper'
 MAPPER_BINARY = '/tmp/mapper'
 COPY_CHUNK_BYTES = 8 * 1024 * 1024
-RANGE_MERGE_GAP_BYTES = 8 * 1024 * 1024
-UINT64_BYTES = 8
+MAX_GUIDES = int(os.getenv('MAX_GUIDES_PER_GROUP', '5'))
 MAPPER_RESULT = struct.Struct('<QI4xdd')
 SCORE_RESULT = struct.Struct('<Id')
 
@@ -23,13 +22,13 @@ s3_client = boto3.client('s3')
 
 def _parse_task(record):
     task = json.loads(record['body'])
-    if task.get('schemaVersion') != 4:
+    if task.get('schemaVersion') != 5:
         raise ValueError('Unsupported or missing Mapper task schemaVersion')
 
     required = (
         'batchId', 'jobId', 'guides', 'genome',
-        'shardId', 'shardCount', 'sliceId', 'selectedBuckets', 'ranges',
-        'issl', 'manifest', 'output',
+        'shardId', 'shardCount', 'sliceId', 'buckets',
+        'scoringMetadata', 'output',
     )
     for field in required:
         if field not in task:
@@ -37,8 +36,10 @@ def _parse_task(record):
 
     if not task['guides']:
         raise ValueError('Mapper task must contain at least one guide')
-    if len(task['guides']) > 5:
-        raise ValueError('Mapper task cannot contain more than five guides')
+    if len(task['guides']) > MAX_GUIDES:
+        raise ValueError(
+            f'Mapper task cannot contain more than {MAX_GUIDES} guides'
+        )
 
     target_ids = set()
     for guide in task['guides']:
@@ -102,139 +103,6 @@ def _copy_s3_range(bucket, key, start, end, destination, offset):
             f'received {copied}'
         )
     return copied
-
-
-def _merge_bucket_ranges(buckets):
-    nonempty = [item for item in buckets if item['endByte'] > item['startByte']]
-    ranges = []
-    for bucket in sorted(nonempty, key=lambda item: item['startByte']):
-        if ranges and bucket['startByte'] - ranges[-1]['endByte'] <= RANGE_MERGE_GAP_BYTES:
-            ranges[-1]['endByte'] = max(ranges[-1]['endByte'], bucket['endByte'])
-        else:
-            ranges.append({
-                'startByte': bucket['startByte'],
-                'endByte': bucket['endByte'],
-            })
-    return ranges
-
-
-def _bucket_plan(task, manifest, guides):
-    if manifest.get('schemaVersion') != 2:
-        raise ValueError('Unsupported or missing shard manifest schemaVersion')
-    shards = manifest.get('shards', [])
-    shard_id = int(task['shardId'])
-    try:
-        shard = next(item for item in shards if int(item['shardId']) == shard_id)
-    except StopIteration as error:
-        raise ValueError(f'Manifest is missing shard {shard_id}') from error
-    if int(shard['sliceId']) != int(task['sliceId']):
-        raise ValueError('Mapper task slice does not match manifest')
-
-    offsets = [int(value) for value in shard['bucketOffsets']]
-    slice_limit = int(manifest['layout']['sliceLimit'])
-    if len(offsets) != slice_limit + 1:
-        raise ValueError('Manifest has invalid bucket offsets')
-    if any(end < start for start, end in zip(offsets, offsets[1:])):
-        raise ValueError('Manifest bucket offsets are not monotonic')
-
-    bucket_ids = sorted({int(guide['bucketId']) for guide in guides})
-    if any(bucket_id < 0 or bucket_id >= slice_limit for bucket_id in bucket_ids):
-        raise ValueError('Mapper guide bucket ID is outside the slice')
-    slice_width = int(manifest['layout']['sliceWidth'])
-    for guide in guides:
-        signature = _sequence_to_signature(guide['guideSequence'])
-        expected = (
-            signature >> (int(task['sliceId']) * slice_width)
-        ) & (slice_limit - 1)
-        if int(guide['bucketId']) != expected:
-            raise ValueError('Mapper guide bucket ID does not match its sequence')
-    buckets = [
-        {
-            'bucketId': bucket_id,
-            'startByte': offsets[bucket_id],
-            'endByte': offsets[bucket_id + 1],
-        }
-        for bucket_id in bucket_ids
-    ]
-    ranges = _merge_bucket_ranges(buckets)
-    return buckets, ranges
-
-
-def _validate_dispatcher_plan(task, manifest):
-    buckets, ranges = _bucket_plan(task, manifest, task['guides'])
-    expected_buckets = [
-        {
-            'bucketId': int(item['bucketId']),
-            'startByte': int(item['startByte']),
-            'endByte': int(item['endByte']),
-        }
-        for item in task['selectedBuckets']
-    ]
-    expected_ranges = [
-        {
-            'startByte': int(item['startByte']),
-            'endByte': int(item['endByte']),
-            'bucketIds': [int(value) for value in item['bucketIds']],
-        }
-        for item in task['ranges']
-    ]
-    calculated_ranges = _merge_bucket_ranges(buckets)
-    for item in calculated_ranges:
-        item['bucketIds'] = [
-            bucket['bucketId'] for bucket in buckets
-            if item['startByte'] <= bucket['startByte']
-            and bucket['endByte'] <= item['endByte']
-            and bucket['endByte'] > bucket['startByte']
-        ]
-    if expected_buckets != buckets or expected_ranges != calculated_ranges:
-        raise ValueError('Mapper task bucket plan does not match its manifest')
-
-
-def _materialize_compact_issl(task, manifest, guides, path):
-    source = task['issl']
-    base_offset = int(manifest['layout']['baseOffsetBytes'])
-    buckets, ranges = _bucket_plan(task, manifest, guides)
-    if not 0 < base_offset:
-        raise ValueError('Invalid ISSL prefix boundary')
-
-    with open(path, 'w+b') as destination:
-        prefix_bytes = _copy_s3_range(
-            source['bucket'], source['key'], 0, base_offset,
-            destination, 0,
-        )
-        compact_offset = base_offset
-        compact_ranges = []
-        for item in ranges:
-            copied = _copy_s3_range(
-                source['bucket'], source['key'], item['startByte'],
-                item['endByte'], destination, compact_offset,
-            )
-            compact_ranges.append({**item, 'compactOffset': compact_offset})
-            compact_offset += copied
-        destination.truncate(compact_offset)
-
-    plans = []
-    for bucket in buckets:
-        if bucket['endByte'] == bucket['startByte']:
-            bucket_compact_offset = base_offset
-        else:
-            containing = next(
-                item for item in compact_ranges
-                if item['startByte'] <= bucket['startByte']
-                and bucket['endByte'] <= item['endByte']
-            )
-            bucket_compact_offset = (
-                containing['compactOffset']
-                + bucket['startByte'] - containing['startByte']
-            )
-        plans.append({
-            'bucketId': bucket['bucketId'],
-            'compactOffset': bucket_compact_offset,
-            'elementCount': (
-                bucket['endByte'] - bucket['startByte']
-            ) // UINT64_BYTES,
-        })
-    return prefix_bytes, compact_offset - base_offset, plans, compact_ranges
 
 
 def _write_mapper_inputs(task, guides, bucket_plans, directory):
@@ -330,6 +198,7 @@ def _run_mapper(task, directory, issl_path, query_path, shard_path):
         str(scoring.get('maxDistance', 4)),
         str(scoring.get('scoreThreshold', 75)),
         str(scoring.get('scoreMethod', 'and')),
+        os.path.join(directory, 'candidates.bin'),
         shard_path,
         output_prefix,
     ]
@@ -370,6 +239,55 @@ def _upload_results(task, guide, result, metadata):
     )
 
 
+def _read_json(bucket, key):
+    return json.loads(s3_client.get_object(Bucket=bucket, Key=key)['Body'].read())
+
+
+def _download_object(bucket, key, output):
+    response = s3_client.get_object(Bucket=bucket, Key=key)
+    while True:
+        chunk = response['Body'].read(COPY_CHUNK_BYTES)
+        if not chunk:
+            break
+        output.write(chunk)
+
+
+def _materialize_candidates(task, directory):
+    path = os.path.join(directory, 'candidates.bin')
+    plans = []
+    fragment_count = 0
+    with open(path, 'wb') as output:
+        for bucket in sorted(task['buckets'], key=lambda item: int(item['bucketId'])):
+            manifest = _read_json(task['output']['bucket'], bucket['manifestKey'])
+            if (manifest.get('schemaVersion') != 1
+                    or int(manifest['sliceId']) != int(task['sliceId'])
+                    or int(manifest['bucketId']) != int(bucket['bucketId'])):
+                raise ValueError('Invalid hydrated bucket manifest')
+            offset = output.tell()
+            count = 0
+            for part in sorted(manifest['parts'], key=lambda item: int(item['startId'])):
+                part_count = int(part['recordCount'])
+                if part_count:
+                    part_offset = output.tell()
+                    _download_object(task['output']['bucket'], part['key'], output)
+                    if output.tell() - part_offset != part_count * 16:
+                        raise ValueError('Hydrated candidate part does not match manifest')
+                count += part_count
+                fragment_count += 1
+            if output.tell() - offset != count * 16:
+                raise ValueError('Hydrated candidate bytes do not match manifest')
+            plans.append({'bucketId': int(bucket['bucketId']),
+                          'compactOffset': offset, 'elementCount': count})
+    return path, plans, fragment_count
+
+
+def _materialize_scoring_metadata(task, path):
+    source = task['scoringMetadata']
+    with open(path, 'w+b') as output:
+        return _copy_s3_range(source['bucket'], source['key'], 0,
+                              int(source['endByte']), output, 0)
+
+
 def _process(task):
     guides = [
         guide for guide in task['guides']
@@ -382,22 +300,15 @@ def _process(task):
         }))
         return
 
-    manifest_response = s3_client.get_object(
-        Bucket=task['manifest']['bucket'],
-        Key=task['manifest']['key'],
-    )
-    manifest = json.loads(manifest_response['Body'].read())
-    _validate_dispatcher_plan(task, manifest)
-
     if not os.path.exists(MAPPER_BINARY):
         shutil.copyfile(MAPPER_BINARY_SOURCE, MAPPER_BINARY)
         os.chmod(MAPPER_BINARY, 0o755)
 
     with tempfile.TemporaryDirectory(dir='/tmp') as directory:
-        issl_path = os.path.join(directory, 'index.issl')
-        prefix_bytes, bucket_bytes, bucket_plans, compact_ranges = (
-            _materialize_compact_issl(task, manifest, guides, issl_path)
-        )
+        issl_path = os.path.join(directory, 'scoring-metadata.bin')
+        prefix_bytes = _materialize_scoring_metadata(task, issl_path)
+        _, bucket_plans, fragment_count = _materialize_candidates(task, directory)
+        bucket_bytes = sum(plan['elementCount'] * 16 for plan in bucket_plans)
         query_path, shard_path = _write_mapper_inputs(
             task, guides, bucket_plans, directory,
         )
@@ -434,7 +345,7 @@ def _process(task):
                     'selectedBuckets': bucket_bytes,
                 },
                 'selectedBucketIds': [plan['bucketId'] for plan in bucket_plans],
-                'rangeCount': len(compact_ranges),
+                'fragmentCount': fragment_count,
                 'outputs': {
                     'mit': guide['output']['mitKey'],
                     'cfd': guide['output']['cfdKey'],

@@ -16,15 +16,32 @@ The source implementation used for this binary is
 `isslScoreOfftargetsMapper.cpp`. Its build command is:
 
 ```text
-g++ -o mapper isslScoreOfftargetsMapper.cpp -O3 -std=c++11 -fopenmp -mpopcnt -Iinclude
+sudo docker run --rm \
+  --platform linux/amd64 \
+  --entrypoint /bin/bash \
+  -v "$PWD:/src" \
+  -w /src \
+  public.ecr.aws/lambda/python:3.10 \
+  -lc '
+    yum install -y gcc-c++ libgomp &&
+    g++ -o mapper \
+      isslScoreOfftargetsMapper.cpp \
+      -O3 \
+      -std=c++11 \
+      -fopenmp \
+      -mpopcnt \
+      -Iinclude \
+      -static-libgcc \
+      -static-libstdc++
+  '
 ```
 
 The precompiled `mapper` binary was introduced into this AWS repository in
 commit `e3a35b2` (`Feature: Add memory-aware shard mapper outputs`). Compilation
 was performed outside this repository from the supplied local
-`isslScoreOfftargetsMapper.cpp`; that source directory is: 
-https://github.com/HuanNguyen-Dev/Crackling/commit/7fd6043e1cbe9f322ec3b91c16fac91780bb58b7, 
-in the commit `7fd6043`.
+`isslScoreOfftargetsMapper.cpp`; that source directory is:
+https://github.com/HuanNguyen-Dev/Crackling/commit/65e5b69736d3f88ee17a5d63dfdeb0f797b38496,
+in the commit `65e5b69736d3f88ee17a5d63dfdeb0f797b38496`.
 
 The Mapper's native combined output is an invocation-local intermediate. The
 wrapper streams it into separate compact MIT and CFD objects containing packed
