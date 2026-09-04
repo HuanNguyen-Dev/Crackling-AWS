@@ -178,15 +178,25 @@ def _dispatch_group(guides, genome, manifest):
         return
 
     job_id = str(guides[0]['JobID'])
-    batch_id = _hash(job_id, *(int(g['TargetID']) for g in guides))
+    batch_id = _hash(
+        job_id,
+        *(int(g['TargetID']) for g in guides),
+        f'extractors={EXTRACTOR_COUNT}',
+    )
     prefix = f'{genome}/issl/extractions/{job_id}/{batch_id}'
     batch_key = f'{prefix}/batch.json'
-    batch = {'schemaVersion': 1, 'batchId': batch_id, 'expectedParts': EXTRACTOR_COUNT,
-             'missingBuckets': missing, 'mapperTasks': mapper_tasks}
+    count = int(manifest['layout']['offtargetsCount'])
+    batch = {
+        'schemaVersion': 1,
+        'batchId': batch_id,
+        'expectedParts': EXTRACTOR_COUNT,
+        'offtargetsCount': count,
+        'missingBuckets': missing,
+        'mapperTasks': mapper_tasks,
+    }
     s3.put_object(Bucket=BUCKET, Key=batch_key,
                   Body=json.dumps(batch, separators=(',', ':')).encode(),
                   ContentType='application/json')
-    count = int(manifest['layout']['offtargetsCount'])
     catalogue_start = 48 + int(manifest['layout']['scoresCount']) * 16
     tasks = []
     for part_id in range(EXTRACTOR_COUNT):

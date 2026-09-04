@@ -36,10 +36,15 @@ def _process(message):
     if _json(dispatched_key) is not None:
         return True
     parts = []
-    for part_id in range(int(batch['expectedParts'])):
+    expected_parts = int(batch['expectedParts'])
+    for part_id in range(expected_parts):
         marker = _json(f'{message["completionPrefix"]}/{part_id}/result.json')
         if marker is None:
             return False
+        if (marker.get('batchId') != batch['batchId']
+                or int(marker.get('partId', -1)) != part_id
+                or int(marker.get('expectedParts', -1)) != expected_parts):
+            raise ValueError('Extractor completion marker does not match its batch')
         parts.append(marker)
 
     for bucket in batch['missingBuckets']:
@@ -49,6 +54,14 @@ def _process(message):
                             if int(item['sliceId']) == int(bucket['sliceId'])
                             and int(item['bucketId']) == int(bucket['bucketId']))
             fragments.append(fragment)
+        fragments.sort(key=lambda item: int(item['startId']))
+        next_id = 0
+        for fragment in fragments:
+            if int(fragment['startId']) != next_id:
+                raise ValueError('Extractor fragments do not form contiguous ID ranges')
+            next_id = int(fragment['endId'])
+        if next_id != int(batch['offtargetsCount']):
+            raise ValueError('Extractor fragments do not cover the off-target catalogue')
         manifest = {
             'schemaVersion': 1, 'sliceId': bucket['sliceId'], 'bucketId': bucket['bucketId'],
             'recordFormat': {'endianness': 'little', 'recordBytes': 16,
