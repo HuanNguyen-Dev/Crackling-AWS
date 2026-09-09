@@ -13,6 +13,8 @@ SHARD_COUNT = int(os.getenv('NUM_SHARDS', '5'))
 MAX_EXTRACTORS = int(os.getenv('MAX_EXTRACTORS', '50'))
 EXTRACTOR_SAFE_BYTES = int(os.getenv('EXTRACTOR_SAFE_BYTES', str(8 * 1024 ** 3)))
 MAX_GUIDES = int(os.getenv('MAX_GUIDES_PER_GROUP', '5'))
+MAX_EXTRACTION_GUIDES = int(os.getenv('MAX_GUIDES_PER_EXTRACTION_GROUP', '100'))
+EXTRACTION_BUCKET_BUDGET_MULTIPLIER = int(os.getenv('EXTRACTION_BUCKET_BUDGET_MULTIPLIER', '1'))
 MAX_DISTANCE = int(os.getenv('MAX_DISTANCE', '4'))
 SCORE_THRESHOLD = float(os.getenv('SCORE_THRESHOLD', '75'))
 SCORE_METHOD = os.getenv('SCORE_METHOD', 'and')
@@ -23,7 +25,8 @@ CATALOGUE_RECORD_BYTES = 8
 RAW_BUCKET_RECORD_BYTES = 8
 HYDRATED_RECORD_BYTES = 16
 
-if MAX_EXTRACTORS < 1 or EXTRACTOR_SAFE_BYTES < 1 or MAX_GUIDES < 1:
+if min(MAX_EXTRACTORS, EXTRACTOR_SAFE_BYTES, MAX_GUIDES, MAX_EXTRACTION_GUIDES,
+       EXTRACTION_BUCKET_BUDGET_MULTIPLIER) < 1:
     raise ValueError('Extractor limits and maximum guide batch size must be positive')
 
 
@@ -166,9 +169,14 @@ def _mapper_tasks(guides, genome, manifest, selected):
     tasks = []
     for shard in manifest['shards']:
         slice_id = int(shard['sliceId'])
+        required_buckets = {
+            _bucket(guide['Sequence'], slice_id, manifest['layout'])
+            for guide in guides
+        }
         bucket_refs = [
             {'bucketId': item['bucketId'], 'manifestKey': item['manifestKey']}
             for item in selected if item['sliceId'] == slice_id
+            and item['bucketId'] in required_buckets
         ]
         contracts = []
         for guide in guides:
@@ -228,10 +236,8 @@ def _partition_guides(guides, manifest):
     groups = []
     remaining = guides
     while len(remaining) > MAX_GUIDES:
-        # Dispatcher SQS events currently contain at most ten guides. Keep the
-        # exhaustive locality choice used by the bucket-selective pipeline for
-        # that common case, and fall back to deterministic chunks if the event
-        # source batch is increased substantially in the future.
+        # Preserve the exhaustive locality choice for the final small mapper
+        # groups; use deterministic chunks for larger extraction groups.
         if len(remaining) <= MAX_GUIDES * 2 and len(remaining) <= 20:
             candidates = []
             for first_size in range(1, MAX_GUIDES + 1):
@@ -263,7 +269,7 @@ def _partition_guides(guides, manifest):
     return groups
 
 
-def _dispatch_group(guides, genome, manifest):
+def _selected_buckets(guides, genome, manifest):
     selected = []
     for shard in manifest['shards']:
         slice_id = int(shard['sliceId'])
@@ -277,14 +283,79 @@ def _dispatch_group(guides, genome, manifest):
                 'cachePrefix': prefix, 'manifestKey': manifest_key,
                 'cached': _json(manifest_key) is not None,
             })
-    mapper_tasks = _mapper_tasks(guides, genome, manifest, selected)
+    return selected
+
+
+def _partition_extraction_guides(guides, genome, manifest):
+    """Bound cumulative raw bucket work, reusing cache checks within this event."""
+    guides = sorted(guides, key=lambda item: int(item['TargetID']))
+    selected = _selected_buckets(guides, genome, manifest)
+    by_bucket = {(item['sliceId'], item['bucketId']): item for item in selected}
+    allocation = None
+    budget = 0
+    if any(not item['cached'] for item in selected):
+        allocation = _extractor_allocation(manifest)
+        catalogue_part_bytes = (
+            _ceil_div(allocation['offtargetsCount'], allocation['extractorCount'])
+            * CATALOGUE_RECORD_BYTES
+        )
+        budget = catalogue_part_bytes * EXTRACTION_BUCKET_BUDGET_MULTIPLIER
+
+    group, keys, missing_bytes = [], set(), 0
+    for guide in guides:
+        guide_keys = {
+            (int(shard['sliceId']),
+             _bucket(guide['Sequence'], int(shard['sliceId']), manifest['layout']))
+            for shard in manifest['shards']
+        }
+        added_bytes = sum(
+            int(by_bucket[key]['endByte']) - int(by_bucket[key]['startByte'])
+            for key in guide_keys - keys if not by_bucket[key]['cached']
+        )
+        if group and (missing_bytes + added_bytes > budget
+                      or len(group) >= MAX_EXTRACTION_GUIDES):
+            yield group, [by_bucket[key] for key in sorted(keys)], allocation
+            group, keys, missing_bytes = [], set(), 0
+            added_bytes = sum(
+                int(by_bucket[key]['endByte']) - int(by_bucket[key]['startByte'])
+                for key in guide_keys if not by_bucket[key]['cached']
+            )
+        # A single guide may exceed the work budget: keep it whole and let the
+        # existing per-extractor storage feasibility check decide if it can run.
+        group.append(guide)
+        keys.update(guide_keys)
+        missing_bytes += added_bytes
+    if group:
+        yield group, [by_bucket[key] for key in sorted(keys)], allocation
+
+
+def _dispatch_group(guides, genome, manifest, selected=None, allocation=None):
+    if selected is None:
+        selected = _selected_buckets(guides, genome, manifest)
+    # Share extraction across the larger group, but retain the existing mapper
+    # batch limit and only send each mapper the buckets its guides require.
+    mapper_tasks = [
+        task
+        for group in _partition_guides(guides, manifest)
+        for task in _mapper_tasks(group, genome, manifest, selected)
+    ]
     missing = [{key: value for key, value in item.items() if key != 'cached'}
                for item in selected if not item['cached']]
     if not missing:
         _send(MAPPER_QUEUE, mapper_tasks)
         return
 
-    allocation = _extractor_allocation(manifest)
+    if allocation is None:
+        allocation = _extractor_allocation(manifest)
+    print(json.dumps({
+        'event': 'extraction_guide_batch',
+        'jobId': str(guides[0]['JobID']), 'genome': genome,
+        'guideCount': len(guides), 'missingBucketCount': len(missing),
+        'missingBucketBytes': sum(int(b['endByte']) - int(b['startByte']) for b in missing),
+        'bucketBudgetBytes': _ceil_div(allocation['offtargetsCount'],
+                                      allocation['extractorCount'])
+                             * CATALOGUE_RECORD_BYTES * EXTRACTION_BUCKET_BUDGET_MULTIPLIER,
+    }))
     _check_selected_bucket_feasibility(missing, allocation)
     extractor_count = allocation['extractorCount']
     job_id = str(guides[0]['JobID'])
@@ -344,7 +415,7 @@ def lambda_handler(event, context):
         if not manifest or manifest.get('schemaVersion') != 2:
             raise ValueError('Missing or unsupported ISSL shard manifest')
         guides = sorted(guides_by_id.values(), key=lambda item: int(item['TargetID']))
-        for group in _partition_guides(guides, manifest):
-            _dispatch_group(group, genome, manifest)
+        for group, selected, allocation in _partition_extraction_guides(guides, genome, manifest):
+            _dispatch_group(group, genome, manifest, selected, allocation)
             batches += 1
     return {'processedGuides': len(event.get('Records', [])), 'dispatchedBatches': batches}

@@ -20,12 +20,15 @@ def _json(key):
 
 
 def _send(tasks):
-    response = sqs.send_message_batch(QueueUrl=MAPPER_QUEUE, Entries=[
-        {'Id': str(index), 'MessageBody': json.dumps(task, separators=(',', ':'))}
-        for index, task in enumerate(tasks)
-    ])
-    if response.get('Failed') or len(response.get('Successful', [])) != len(tasks):
-        raise RuntimeError('Failed to publish every Mapper task')
+    for start in range(0, len(tasks), 10):
+        chunk = tasks[start:start + 10]
+        response = sqs.send_message_batch(QueueUrl=MAPPER_QUEUE, Entries=[
+            {'Id': str(start + index),
+             'MessageBody': json.dumps(task, separators=(',', ':'))}
+            for index, task in enumerate(chunk)
+        ])
+        if response.get('Failed') or len(response.get('Successful', [])) != len(chunk):
+            raise RuntimeError('Failed to publish every Mapper task')
 
 
 def _process(message):
