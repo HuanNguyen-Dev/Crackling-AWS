@@ -14,7 +14,6 @@ MAX_EXTRACTORS = int(os.getenv('MAX_EXTRACTORS', '50'))
 EXTRACTOR_SAFE_BYTES = int(os.getenv('EXTRACTOR_SAFE_BYTES', str(8 * 1024 ** 3)))
 MAX_GUIDES = int(os.getenv('MAX_GUIDES_PER_GROUP', '5'))
 MAX_EXTRACTION_GUIDES = int(os.getenv('MAX_GUIDES_PER_EXTRACTION_GROUP', '100'))
-EXTRACTION_BUCKET_BUDGET_MULTIPLIER = int(os.getenv('EXTRACTION_BUCKET_BUDGET_MULTIPLIER', '1'))
 MAX_DISTANCE = int(os.getenv('MAX_DISTANCE', '4'))
 SCORE_THRESHOLD = float(os.getenv('SCORE_THRESHOLD', '75'))
 SCORE_METHOD = os.getenv('SCORE_METHOD', 'and')
@@ -25,8 +24,7 @@ CATALOGUE_RECORD_BYTES = 8
 RAW_BUCKET_RECORD_BYTES = 8
 HYDRATED_RECORD_BYTES = 16
 
-if min(MAX_EXTRACTORS, EXTRACTOR_SAFE_BYTES, MAX_GUIDES, MAX_EXTRACTION_GUIDES,
-       EXTRACTION_BUCKET_BUDGET_MULTIPLIER) < 1:
+if min(MAX_EXTRACTORS, EXTRACTOR_SAFE_BYTES, MAX_GUIDES, MAX_EXTRACTION_GUIDES) < 1:
     raise ValueError('Extractor limits and maximum guide batch size must be positive')
 
 
@@ -286,6 +284,16 @@ def _selected_buckets(guides, genome, manifest):
     return selected
 
 
+def _extraction_bucket_budget(allocation):
+    catalogue_part_bytes = (
+        _ceil_div(allocation['offtargetsCount'], allocation['extractorCount'])
+        * CATALOGUE_RECORD_BYTES
+    )
+    # Reserve raw bucket bytes plus up to twice their size for extracted output.
+    # This limits batches conservatively: buckets are actually processed one at a time.
+    return max(0, (EXTRACTOR_SAFE_BYTES - catalogue_part_bytes) // 3)
+
+
 def _partition_extraction_guides(guides, genome, manifest):
     """Bound cumulative raw bucket work, reusing cache checks within this event."""
     guides = sorted(guides, key=lambda item: int(item['TargetID']))
@@ -295,11 +303,7 @@ def _partition_extraction_guides(guides, genome, manifest):
     budget = 0
     if any(not item['cached'] for item in selected):
         allocation = _extractor_allocation(manifest)
-        catalogue_part_bytes = (
-            _ceil_div(allocation['offtargetsCount'], allocation['extractorCount'])
-            * CATALOGUE_RECORD_BYTES
-        )
-        budget = catalogue_part_bytes * EXTRACTION_BUCKET_BUDGET_MULTIPLIER
+        budget = _extraction_bucket_budget(allocation)
 
     group, keys, missing_bytes = [], set(), 0
     for guide in guides:
@@ -352,9 +356,7 @@ def _dispatch_group(guides, genome, manifest, selected=None, allocation=None):
         'jobId': str(guides[0]['JobID']), 'genome': genome,
         'guideCount': len(guides), 'missingBucketCount': len(missing),
         'missingBucketBytes': sum(int(b['endByte']) - int(b['startByte']) for b in missing),
-        'bucketBudgetBytes': _ceil_div(allocation['offtargetsCount'],
-                                      allocation['extractorCount'])
-                             * CATALOGUE_RECORD_BYTES * EXTRACTION_BUCKET_BUDGET_MULTIPLIER,
+        'bucketBudgetBytes': _extraction_bucket_budget(allocation),
     }))
     _check_selected_bucket_feasibility(missing, allocation)
     extractor_count = allocation['extractorCount']

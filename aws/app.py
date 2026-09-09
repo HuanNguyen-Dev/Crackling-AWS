@@ -548,7 +548,6 @@ class CracklingStack(Stack):
                 'EXTRACTOR_SAFE_BYTES': str(8 * 1024 ** 3),
                 'MAX_GUIDES_PER_GROUP': '5',
                 'MAX_GUIDES_PER_EXTRACTION_GROUP': '100',
-                'EXTRACTION_BUCKET_BUDGET_MULTIPLIER': '1',
                 'MAX_DISTANCE': '4',
                 'SCORE_THRESHOLD': '75',
                 'SCORE_METHOD': 'and'
