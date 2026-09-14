@@ -1,5 +1,4 @@
 import hashlib
-import itertools
 import json
 import os
 
@@ -208,63 +207,12 @@ def _mapper_tasks(guides, genome, manifest, selected):
     return tasks
 
 
-def _group_bytes(guides, manifest):
-    total = 0
-    for shard in manifest['shards']:
-        offsets = shard['bucketOffsets']
-        bucket_ids = {
-            _bucket(guide['Sequence'], int(shard['sliceId']), manifest['layout'])
-            for guide in guides
-        }
-        # Original buckets contain 8-byte ID/occurrence entries. Hydrated
-        # candidate records are 16 bytes, so their exact projected size is
-        # twice the selected source-bucket bytes.
-        total += sum(
-            (int(offsets[bucket_id + 1]) - int(offsets[bucket_id])) * 2
-            for bucket_id in bucket_ids
-        )
-    return total
-
-
 def _partition_guides(guides, manifest):
     guides = sorted(guides, key=lambda item: int(item['TargetID']))
     if len(guides) <= MAX_GUIDES:
         return [guides]
-
-    groups = []
-    remaining = guides
-    while len(remaining) > MAX_GUIDES:
-        # Preserve the exhaustive locality choice for the final small mapper
-        # groups; use deterministic chunks for larger extraction groups.
-        if len(remaining) <= MAX_GUIDES * 2 and len(remaining) <= 20:
-            candidates = []
-            for first_size in range(1, MAX_GUIDES + 1):
-                second_size = len(remaining) - first_size
-                if not 1 <= second_size <= MAX_GUIDES:
-                    continue
-                for tail in itertools.combinations(
-                        range(1, len(remaining)), first_size - 1):
-                    indexes = {0, *tail}
-                    first = [
-                        item for index, item in enumerate(remaining)
-                        if index in indexes
-                    ]
-                    second = [
-                        item for index, item in enumerate(remaining)
-                        if index not in indexes
-                    ]
-                    tie = tuple(int(item['TargetID']) for item in first)
-                    candidates.append((max(_group_bytes(first, manifest),
-                                           _group_bytes(second, manifest)), tie,
-                                       first, second))
-            _, _, first, second = min(candidates, key=lambda item: (item[0], item[1]))
-            groups.extend((first, second))
-            return groups
-        groups.append(remaining[:MAX_GUIDES])
-        remaining = remaining[MAX_GUIDES:]
-    if remaining:
-        groups.append(remaining)
-    return groups
+    return [guides[start:start + MAX_GUIDES]
+            for start in range(0, len(guides), MAX_GUIDES)]
 
 
 def _selected_buckets(guides, genome, manifest):
