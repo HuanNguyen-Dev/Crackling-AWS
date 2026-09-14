@@ -13,7 +13,6 @@ from botocore.exceptions import ClientError
 MAPPER_BINARY_SOURCE = '/opt/mapper'
 MAPPER_BINARY = '/tmp/mapper'
 COPY_CHUNK_BYTES = 8 * 1024 * 1024
-MAX_GUIDES = int(os.getenv('MAX_GUIDES_PER_GROUP', '5'))
 MAPPER_RESULT = struct.Struct('<QI4xdd')
 SCORE_RESULT = struct.Struct('<Id')
 
@@ -36,10 +35,6 @@ def _parse_task(record):
 
     if not task['guides']:
         raise ValueError('Mapper task must contain at least one guide')
-    if len(task['guides']) > MAX_GUIDES:
-        raise ValueError(
-            f'Mapper task cannot contain more than {MAX_GUIDES} guides'
-        )
 
     target_ids = set()
     for guide in task['guides']:

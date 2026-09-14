@@ -11,7 +11,7 @@ EXTRACTOR_QUEUE = os.environ['EXTRACTOR_QUEUE']
 SHARD_COUNT = int(os.getenv('NUM_SHARDS', '5'))
 MAX_EXTRACTORS = int(os.getenv('MAX_EXTRACTORS', '50'))
 EXTRACTOR_SAFE_BYTES = int(os.getenv('EXTRACTOR_SAFE_BYTES', str(8 * 1024 ** 3)))
-MAX_GUIDES = int(os.getenv('MAX_GUIDES_PER_GROUP', '5'))
+MAPPER_SAFE_BYTES = int(os.getenv('MAPPER_SAFE_BYTES', str(8 * 1024 ** 3)))
 MAX_EXTRACTION_GUIDES = int(os.getenv('MAX_GUIDES_PER_EXTRACTION_GROUP', '100'))
 MAX_DISTANCE = int(os.getenv('MAX_DISTANCE', '4'))
 SCORE_THRESHOLD = float(os.getenv('SCORE_THRESHOLD', '75'))
@@ -23,7 +23,7 @@ CATALOGUE_RECORD_BYTES = 8
 RAW_BUCKET_RECORD_BYTES = 8
 HYDRATED_RECORD_BYTES = 16
 
-if min(MAX_EXTRACTORS, EXTRACTOR_SAFE_BYTES, MAX_GUIDES, MAX_EXTRACTION_GUIDES) < 1:
+if min(MAX_EXTRACTORS, EXTRACTOR_SAFE_BYTES, MAPPER_SAFE_BYTES, MAX_EXTRACTION_GUIDES) < 1:
     raise ValueError('Extractor limits and maximum guide batch size must be positive')
 
 
@@ -208,11 +208,46 @@ def _mapper_tasks(guides, genome, manifest, selected):
 
 
 def _partition_guides(guides, manifest):
+    """Greedily bound metadata plus distinct hydrated buckets in every mapper."""
     guides = sorted(guides, key=lambda item: int(item['TargetID']))
-    if len(guides) <= MAX_GUIDES:
-        return [guides]
-    return [guides[start:start + MAX_GUIDES]
-            for start in range(0, len(guides), MAX_GUIDES)]
+    prefix_bytes = 48 + int(manifest['layout']['scoresCount']) * 16
+    shards = manifest['shards']
+    groups, group = [], []
+    bucket_ids = [set() for _ in shards]
+    sizes = [prefix_bytes for _ in shards]
+    for guide in guides:
+        selected = [
+            _bucket(guide['Sequence'], int(shard['sliceId']), manifest['layout'])
+            for shard in shards
+        ]
+        # Each raw 8-byte bucket record becomes a 16-byte hydrated record.
+        hydrated_bytes = [
+            2 * (int(shard['bucketOffsets'][bucket_id + 1])
+                 - int(shard['bucketOffsets'][bucket_id]))
+            for shard, bucket_id in zip(shards, selected)
+        ]
+        if any(prefix_bytes + size > MAPPER_SAFE_BYTES for size in hydrated_bytes):
+            raise ValueError(
+                f'Guide {guide["TargetID"]} exceeds Mapper safe input limit '
+                f'{MAPPER_SAFE_BYTES} bytes'
+            )
+        if group and any(
+            size + (0 if bucket_id in seen else added) > MAPPER_SAFE_BYTES
+            for size, bucket_id, seen, added
+            in zip(sizes, selected, bucket_ids, hydrated_bytes)
+        ):
+            groups.append(group)
+            group = []
+            bucket_ids = [set() for _ in shards]
+            sizes = [prefix_bytes for _ in shards]
+        group.append(guide)
+        for index, bucket_id in enumerate(selected):
+            if bucket_id not in bucket_ids[index]:
+                sizes[index] += hydrated_bytes[index]
+                bucket_ids[index].add(bucket_id)
+    if group:
+        groups.append(group)
+    return groups
 
 
 def _selected_buckets(guides, genome, manifest):
@@ -284,8 +319,7 @@ def _partition_extraction_guides(guides, genome, manifest):
 def _dispatch_group(guides, genome, manifest, selected=None, allocation=None):
     if selected is None:
         selected = _selected_buckets(guides, genome, manifest)
-    # Share extraction across the larger group, but retain the existing mapper
-    # batch limit and only send each mapper the buckets its guides require.
+    # Share extraction, then size mapper groups using their required buckets.
     mapper_tasks = [
         task
         for group in _partition_guides(guides, manifest)

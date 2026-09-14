@@ -546,7 +546,7 @@ class CracklingStack(Stack):
                 'NUM_SHARDS': '5',
                 'MAX_EXTRACTORS': '50',
                 'EXTRACTOR_SAFE_BYTES': str(8 * 1024 ** 3),
-                'MAX_GUIDES_PER_GROUP': '5',
+                'MAPPER_SAFE_BYTES': str(8 * 1024 ** 3),
                 'MAX_GUIDES_PER_EXTRACTION_GROUP': '100',
                 'MAX_DISTANCE': '4',
                 'SCORE_THRESHOLD': '75',
@@ -653,8 +653,7 @@ class CracklingStack(Stack):
             ephemeral_storage_size=cdk.Size.gibibytes(10),
             environment={
                 'LD_LIBRARY_PATH': ld_library_path,
-                'OMP_NUM_THREADS': '6',
-                'MAX_GUIDES_PER_GROUP': '5'
+                'OMP_NUM_THREADS': '6'
             }
         )
         sqsIsslMapper.grant_consume_messages(lambdaIsslMapper)
