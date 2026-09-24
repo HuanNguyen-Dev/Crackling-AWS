@@ -260,17 +260,23 @@ def _materialize_candidates(task, directory):
                 raise ValueError('Invalid hydrated bucket manifest')
             offset = output.tell()
             count = 0
+            record_bytes = int(manifest['recordFormat']['recordBytes'])
+            if (int(manifest['idBits']) != int(task['idBits'])
+                    or record_bytes != int(task['hydratedRecordBytes'])):
+                raise ValueError('Hydrated bucket width does not match Mapper task')
             for part in sorted(manifest['parts'], key=lambda item: int(item['startId'])):
                 part_count = int(part['recordCount'])
                 if part_count:
                     part_offset = output.tell()
                     _download_object(task['output']['bucket'], part['key'], output)
-                    if output.tell() - part_offset != part_count * 16:
+                    if output.tell() - part_offset != part_count * record_bytes:
                         raise ValueError('Hydrated candidate part does not match manifest')
                 count += part_count
                 fragment_count += 1
-            if output.tell() - offset != count * 16:
-                raise ValueError('Hydrated candidate bytes do not match manifest')
+
+            if output.tell() - offset != count * record_bytes:
+                raise ValueError('Hydrated candidate bytes do not match manifest')    
+                
             plans.append({'bucketId': int(bucket['bucketId']),
                           'compactOffset': offset, 'elementCount': count})
     return path, plans, fragment_count
