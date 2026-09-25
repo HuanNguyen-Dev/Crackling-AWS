@@ -37,80 +37,131 @@ def _read_s3_range(key, start, length):
     return data
 
 
-def _read_issl_layout(key):
-    # Crackling ISSL files are produced and consumed on x86_64 Linux. The six
-    # native size_t header fields are therefore little-endian unsigned 64-bit
-    # integers, matching the current C++ Coordinator implementation.
-    header_data = _read_s3_range(key, 0, ISSL_HEADER_BYTES)
-    (
-        offtargets_count,
-        sequence_length,
-        sequence_count,
-        slice_width,
-        slice_count,
-        scores_count,
-    ) = struct.unpack('<6Q', header_data)
+def _read_issl_layout(key, file_bytes):
+    """
+    Read the newly built matching-format ISSL index and produce:
 
-    if slice_count != NUM_SHARDS:
-        raise ValueError(
-            f'ISSL contains {slice_count} slices; bucket-level scoring '
-            f'requires exactly {NUM_SHARDS}'
-        )
-    if MAX_DISTANCE != 4:
-        raise ValueError('Bucket-level scoring requires MAX_DISTANCE=4')
+        layout: global catalogue metadata and hydrated-record ID contract
+        shards: one entry per ISSL slice, including its real mask, bucket
+                entry counts, and absolute byte offsets for each compressed
+                bucket stream.
 
-    slice_limit = 1 << slice_width
-    slicelist_size_count = slice_count * slice_limit
-    slicelist_sizes_offset = (
-        ISSL_HEADER_BYTES
-        + scores_count * (UINT64_BYTES + DOUBLE_BYTES)
-        + offtargets_count * UINT64_BYTES
-    )
-    slicelist_sizes_bytes = slicelist_size_count * SIZE_T_BYTES
-    slicelist_sizes_data = _read_s3_range(
-        key,
-        slicelist_sizes_offset,
-        slicelist_sizes_bytes,
-    )
-    slicelist_sizes = struct.unpack(
-        f'<{slicelist_size_count}Q',
-        slicelist_sizes_data,
-    )
+    On-disk matching-format ISSL structure, all little-endian:
 
-    base_offset_bytes = slicelist_sizes_offset + slicelist_sizes_bytes
-    return {
-        'offtargetsCount': offtargets_count,
-        'sequenceLength': sequence_length,
-        'sequenceCount': sequence_count,
-        'sliceWidth': slice_width,
-        'sliceCount': slice_count,
-        'scoresCount': scores_count,
-        'sliceLimit': slice_limit,
-        'baseOffsetBytes': base_offset_bytes,
-        'slicelistSizes': slicelist_sizes,
-    }
+        Header
+            uint64 N                 unique off-target count
+            uint64 sequenceLength    expected to be 20
+            uint64 sliceCount
 
+        Global catalogue
+            N x 5 bytes              packed 40-bit off-target signatures
+            N x uint32               occurrence counts
 
-def _calculate_shards(layout):
-    slice_count = layout['sliceCount']
-    slice_limit = layout['sliceLimit']
-    running_byte = layout['baseOffsetBytes']
+        Slice masks
+            sliceCount x uint64      position masks
+
+        For each slice:
+            B x uint64               bucket decoded-entry counts
+            B x uint64               bucket compressed-byte counts
+            uint64                   total compressed payload bytes
+            B contiguous byte streams
+                                    each is LEB128 delta-encoded global IDs
+
+        B is determined separately for each slice:
+
+            B = 1 << (2 * popcount(mask))
+
+    A bucket stream starts with an absolute global ID. Each later LEB128
+    value is a positive delta from the preceding ID. The resulting global ID
+    indexes both global catalogue arrays above.
+
+    This function reads the real masks and
+    derives each slice's bucket layout from its own mask.
+    """
+    def words(start, count):
+        data = _read_s3_range(key, start, count * 8)
+        return struct.unpack(f'<{count}Q', data)
+
+    n, sequence_length, slice_count = words(0, 3)
+    contract = _id_contract(n)
+    if sequence_length != 20:
+        raise ValueError('Expected a 20-base matching-format index')
+    if slice_count == 0:
+        raise ValueError('Invalid slice count')
+
+    signature_offset = 24
+    occurrence_offset = signature_offset + 5 * n
+    mask_offset = occurrence_offset + 4 * n
+    masks = words(mask_offset, slice_count)
+    cursor = mask_offset + 8 * slice_count
+
     shards = []
-    for shard_id in range(NUM_SHARDS):
-        bucket_offsets = [running_byte]
-        first_bucket = shard_id * slice_limit
-        for bucket_size in layout['slicelistSizes'][
-            first_bucket:first_bucket + slice_limit
-        ]:
-            running_byte += bucket_size * UINT64_BYTES
-            bucket_offsets.append(running_byte)
+    for slice_id, mask in enumerate(masks):
+        weight = int(mask).bit_count()
+        if mask >> 20 or weight == 0:
+            raise ValueError('Slice mask is outside the 20-base signature')
+        bucket_count = 1 << (2 * weight)
+        entry_counts = words(cursor, bucket_count)
+        if sum(entry_counts) != n:
+            raise ValueError("Slice entry counts do not match size")
+        cursor += 8 * bucket_count
+        byte_counts = words(cursor, bucket_count)
+        if any(entry_count == 0 and byte_count != 0 for entry_count, byte_count in zip(entry_counts,byte_counts)):
+            raise ValueError('Empty bucket has encoded payload bytes')
+        cursor += 8 * bucket_count
+        total_bytes, = words(cursor, 1)
+        cursor += 8
+        if sum(byte_counts) != total_bytes:
+            raise ValueError('Compressed bucket lengths do not match slice total')
+        offsets = [cursor]
+        for length in byte_counts:
+            cursor += length
+            offsets.append(cursor)
+        if cursor > file_bytes:
+            raise ValueError('Slice payload exceeds the index object')
         shards.append({
-            'shardId': shard_id,
-            'sliceId': shard_id,
-            'bucketOffsets': bucket_offsets,
+            'shardId': slice_id,
+            'sliceId': slice_id,
+            'mask': mask,
+            'maskWeight': weight,
+            'bucketCount': bucket_count,
+            'bucketEntryCounts': list(entry_counts),
+            'bucketOffsets': offsets,
         })
-    return shards
 
+    if cursor != file_bytes:
+        raise ValueError('Unexpected trailing bytes in matching-format index')
+    return {
+        'format': 'delta-catalogue-v1',
+        'offtargetsCount': n,
+        'sequenceLength': sequence_length,
+        'sliceCount': slice_count,
+        'signatureOffsetBytes': signature_offset,
+        'signatureRecordBytes': 5,
+        'occurrenceOffsetBytes': occurrence_offset,
+        'occurrenceRecordBytes': 4,
+        **contract,
+    }, shards
+
+def _id_contract(offtarget_count):
+    count = int(offtarget_count)
+    if not 0 <= count <= (1 << 40):
+        raise ValueError('Invalid unique 20-base off-target count')
+    if count > (1 << 32):
+        return {
+            'idBits': 64,
+            'hydratedRecordBytes': 20,
+            'hydratedStruct': '<QQI',
+            'scoreRecordBytes': 16,
+            'scoreStruct': '<Qd',
+        }
+    return {
+        'idBits': 32,
+        'hydratedRecordBytes': 16,
+        'hydratedStruct': '<QII',
+        'scoreRecordBytes': 12,
+        'scoreStruct': '<Id',
+    }
 
 def _parse_record(record):
     message = json.loads(record['body'])
@@ -129,10 +180,10 @@ def _process_job(message):
     issl_key = f'{genome}/issl/{genome}.issl'
     output_prefix = f'{genome}/coordinator/{job_id}'
 
-    layout = _read_issl_layout(issl_key)
-    shards = _calculate_shards(layout)
+    file_bytes = s3_client.head_object(Bucket=BUCKET, Key=issl_key)['ContentLength']
+    layout, shards = _read_issl_layout(issl_key, file_bytes)
     audit_document = {
-        'schemaVersion': 2,
+        'schemaVersion': 3,
         'jobId': job_id,
         'genome': genome,
         'maxDistance': MAX_DISTANCE,
