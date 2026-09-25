@@ -8,7 +8,6 @@ from botocore.exceptions import ClientError
 BUCKET = os.environ['BUCKET']
 MAPPER_QUEUE = os.environ['MAPPER_QUEUE']
 EXTRACTOR_QUEUE = os.environ['EXTRACTOR_QUEUE']
-SHARD_COUNT = int(os.getenv('NUM_SHARDS', '5'))
 MAX_EXTRACTORS = int(os.getenv('MAX_EXTRACTORS', '50'))
 EXTRACTOR_SAFE_BYTES = int(os.getenv('EXTRACTOR_SAFE_BYTES', str(8 * 1024 ** 3)))
 MAPPER_SAFE_BYTES = int(os.getenv('MAPPER_SAFE_BYTES', str(8 * 1024 ** 3)))
@@ -19,9 +18,7 @@ SCORE_METHOD = os.getenv('SCORE_METHOD', 'and')
 s3 = boto3.client('s3')
 sqs = boto3.client('sqs')
 
-CATALOGUE_RECORD_BYTES = 8
-RAW_BUCKET_RECORD_BYTES = 8
-HYDRATED_RECORD_BYTES = 16
+CATALOGUE_RECORD_BYTES = 9
 
 if min(MAX_EXTRACTORS, EXTRACTOR_SAFE_BYTES, MAPPER_SAFE_BYTES, MAX_EXTRACTION_GUIDES) < 1:
     raise ValueError('Extractor limits and maximum guide batch size must be positive')
@@ -57,32 +54,50 @@ def _largest_manifest_bucket(manifest):
 
 def _extractor_allocation(manifest):
     """Choose stable ID partitions using immutable, whole-ISSL metadata."""
-    offtarget_count = int(manifest['layout']['offtargetsCount'])
-    if not 0 <= offtarget_count <= 0xffffffff:
-        raise ValueError('ISSL off-target count does not fit the uint32 extractor contract')
+    layout = manifest['layout']
+    offtarget_count = int(layout['offtargetsCount'])
+    hydrated_record_bytes = int(layout['hydratedRecordBytes'])
     catalogue_bytes = offtarget_count * CATALOGUE_RECORD_BYTES
     largest_bucket_bytes = _largest_manifest_bucket(manifest)
-    # One raw 8-byte record produces at most one hydrated 16-byte record.
-    irreducible_bytes = largest_bucket_bytes * (
-        1 + HYDRATED_RECORD_BYTES // RAW_BUCKET_RECORD_BYTES
+
+    max_extractor_count = max(
+        1,
+        min(MAX_EXTRACTORS, offtarget_count) if offtarget_count else 1,
     )
-    available_catalogue_bytes = EXTRACTOR_SAFE_BYTES - irreducible_bytes
-    if available_catalogue_bytes < CATALOGUE_RECORD_BYTES:
-        required = MAX_EXTRACTORS + 1
-    else:
-        records_per_extractor = available_catalogue_bytes // CATALOGUE_RECORD_BYTES
-        required = max(1, _ceil_div(offtarget_count, records_per_extractor))
-    extractor_count = min(required, MAX_EXTRACTORS)
-    if offtarget_count:
-        extractor_count = min(extractor_count, offtarget_count)
+
+    required = max_extractor_count + 1
+
+    for extractor_count in range(1, max_extractor_count + 1):
+        partition_records = _ceil_div(offtarget_count, extractor_count)
+        catalogue_part_bytes = partition_records * CATALOGUE_RECORD_BYTES
+
+        bucket_working_bytes = max((
+            int(bucket_end) - int(bucket_start)
+            + min(int(entry_count), partition_records) * hydrated_record_bytes
+            for shard in manifest['shards']
+            for bucket_start, bucket_end, entry_count in zip(
+                shard['bucketOffsets'],
+                shard['bucketOffsets'][1:],
+                shard['bucketEntryCounts'],
+            )
+        ), default=0)
+
+        estimated_peak_bytes = catalogue_part_bytes + bucket_working_bytes
+
+        if estimated_peak_bytes < EXTRACTOR_SAFE_BYTES:
+            required = extractor_count
+            break
+
+    extractor_count = min(required, max_extractor_count)
+
     return {
-        'extractorCount': max(1, extractor_count),
+        'extractorCount': extractor_count,
         'requiredExtractors': required,
         'offtargetsCount': offtarget_count,
         'catalogueBytes': catalogue_bytes,
         'largestIsslBucketBytes': largest_bucket_bytes,
+        'hydratedRecordBytes': hydrated_record_bytes,
     }
-
 
 def _check_selected_bucket_feasibility(missing, allocation):
     largest = max(
@@ -94,11 +109,19 @@ def _check_selected_bucket_feasibility(missing, allocation):
         _ceil_div(allocation['offtargetsCount'], extractor_count)
         * CATALOGUE_RECORD_BYTES
     )
-    maximum_output_bytes = largest * (
-        HYDRATED_RECORD_BYTES // RAW_BUCKET_RECORD_BYTES
+
+    partition_records = _ceil_div(
+        allocation['offtargetsCount'],
+        allocation['extractorCount'],
     )
+
+    bucket_working_bytes = max((
+    int(bucket['endByte']) - int(bucket['startByte']) + min(int(bucket['elementCount']), partition_records) * allocation['hydratedRecordBytes']
+    for bucket in missing),
+    default=0)
+
     estimated_peak_bytes = (
-        catalogue_part_bytes + largest + maximum_output_bytes
+        catalogue_part_bytes  + bucket_working_bytes
     )
     details = {
         'extractorCount': extractor_count,
@@ -108,7 +131,7 @@ def _check_selected_bucket_feasibility(missing, allocation):
         'catalogueBytesPerExtractor': catalogue_part_bytes,
         'largestIsslBucketBytes': allocation['largestIsslBucketBytes'],
         'largestSelectedBucketBytes': largest,
-        'maximumHydratedOutputBytes': maximum_output_bytes,
+        'largestBucketFootprintBytes': bucket_working_bytes,
         'estimatedPeakBytesPerExtractor': estimated_peak_bytes,
         'safeLimitBytes': EXTRACTOR_SAFE_BYTES,
         'maxExtractors': MAX_EXTRACTORS,
@@ -119,7 +142,7 @@ def _check_selected_bucket_feasibility(missing, allocation):
 
     reason = (
         'BUCKET_EXCEEDS_LAMBDA_LIMIT'
-        if largest + maximum_output_bytes >= EXTRACTOR_SAFE_BYTES
+        if bucket_working_bytes >= EXTRACTOR_SAFE_BYTES
         else 'RETRY_WITH_MORE_EXTRACTORS'
     )
     print(json.dumps({
@@ -142,11 +165,15 @@ def _signature(sequence):
         value |= 'ACGT'.index(base) << (index * 2)
     return value
 
-
-def _bucket(sequence, slice_id, layout):
-    return (_signature(sequence) >> (slice_id * int(layout['sliceWidth']))) & (
-        int(layout['sliceLimit']) - 1)
-
+def _masked_bucket(sequence, mask):
+    signature = _signature(sequence)
+    value = 0
+    selected = 0
+    for position in range(20):
+        if int(mask) & (1 << position):
+            value |= ((signature >> (2 * position)) & 3) << (2 * selected)
+            selected += 1
+    return value
 
 def _send(queue, tasks):
     for batch_start in range(0, len(tasks), 10):
@@ -164,10 +191,11 @@ def _mapper_tasks(guides, genome, manifest, selected):
     guides = sorted(guides, key=lambda item: int(item['TargetID']))
     job_id = str(guides[0]['JobID'])
     tasks = []
+    shards = manifest['shards']
     for shard in manifest['shards']:
         slice_id = int(shard['sliceId'])
         required_buckets = {
-            _bucket(guide['Sequence'], slice_id, manifest['layout'])
+            _masked_bucket(guide['Sequence'], shard['mask'])
             for guide in guides
         }
         bucket_refs = [
@@ -178,7 +206,7 @@ def _mapper_tasks(guides, genome, manifest, selected):
         contracts = []
         for guide in guides:
             target_id = int(guide['TargetID'])
-            bucket_id = _bucket(guide['Sequence'], slice_id, manifest['layout'])
+            bucket_id = _masked_bucket(guide['Sequence'], shard['mask'])
             prefix = f'{genome}/mapper/{job_id}/targets/{target_id}/shards/{slice_id}'
             contracts.append({
                 'taskId': _hash(job_id, target_id, slice_id),
@@ -188,15 +216,13 @@ def _mapper_tasks(guides, genome, manifest, selected):
                            'metadataKey': f'{prefix}/mapper-result.json'},
             })
         tasks.append({
-            'schemaVersion': 5,
+            'schemaVersion': 6,
             'batchId': _hash(job_id, *(g['TargetID'] for g in guides), slice_id),
             'jobId': job_id, 'genome': genome, 'guides': contracts,
-            'shardId': int(shard['shardId']), 'shardCount': SHARD_COUNT,
+            'shardId': int(shard['shardId']), 'shardCount': len(shards),
             'sliceId': slice_id, 'buckets': bucket_refs,
-            'scoringMetadata': {
-                'bucket': manifest['issl']['bucket'], 'key': manifest['issl']['key'],
-                'endByte': 48 + int(manifest['layout']['scoresCount']) * 16,
-            },
+            'idBits': int(manifest['layout']['idBits']),
+            'hydratedRecordBytes': int(manifest['layout']['hydratedRecordBytes']),
             'scoring': {
                 'maxDistance': MAX_DISTANCE,
                 'scoreThreshold': SCORE_THRESHOLD,
@@ -206,27 +232,24 @@ def _mapper_tasks(guides, genome, manifest, selected):
         })
     return tasks
 
-
 def _partition_guides(guides, manifest):
     """Greedily bound metadata plus distinct hydrated buckets in every mapper."""
     guides = sorted(guides, key=lambda item: int(item['TargetID']))
-    prefix_bytes = 48 + int(manifest['layout']['scoresCount']) * 16
+    record_bytes = int(manifest['layout']['hydratedRecordBytes'])
     shards = manifest['shards']
     groups, group = [], []
     bucket_ids = [set() for _ in shards]
-    sizes = [prefix_bytes for _ in shards]
+    sizes = [0 for _ in shards]
     for guide in guides:
         selected = [
-            _bucket(guide['Sequence'], int(shard['sliceId']), manifest['layout'])
+            _masked_bucket(guide['Sequence'], shard['mask'])
             for shard in shards
         ]
-        # Each raw 8-byte bucket record becomes a 16-byte hydrated record.
         hydrated_bytes = [
-            2 * (int(shard['bucketOffsets'][bucket_id + 1])
-                 - int(shard['bucketOffsets'][bucket_id]))
+            int(shard['bucketEntryCounts'][bucket_id]) * record_bytes
             for shard, bucket_id in zip(shards, selected)
         ]
-        if any(prefix_bytes + size > MAPPER_SAFE_BYTES for size in hydrated_bytes):
+        if any(size > MAPPER_SAFE_BYTES for size in hydrated_bytes):
             raise ValueError(
                 f'Guide {guide["TargetID"]} exceeds Mapper safe input limit '
                 f'{MAPPER_SAFE_BYTES} bytes'
@@ -239,7 +262,8 @@ def _partition_guides(guides, manifest):
             groups.append(group)
             group = []
             bucket_ids = [set() for _ in shards]
-            sizes = [prefix_bytes for _ in shards]
+            sizes = [0 for _ in shards]
+
         group.append(guide)
         for index, bucket_id in enumerate(selected):
             if bucket_id not in bucket_ids[index]:
@@ -249,39 +273,80 @@ def _partition_guides(guides, manifest):
         groups.append(group)
     return groups
 
+def _valid_cached_bucket(manifest_key, slice_id, bucket_id, layout):
+    cached = _json(manifest_key)
+    if not isinstance(cached, dict):
+        return False
+
+    record_format = cached.get('recordFormat')
+    if not isinstance(record_format, dict):
+        return False
+
+    try:
+        return (
+            cached.get('schemaVersion') == 2
+            and int(cached.get('sliceId')) == slice_id
+            and int(cached.get('bucketId')) == bucket_id
+            and int(cached.get('idBits')) == int(layout['idBits'])
+            and int(record_format.get('recordBytes'))
+                == int(layout['hydratedRecordBytes'])
+        )
+    except (TypeError, ValueError):
+        return False
 
 def _selected_buckets(guides, genome, manifest):
     selected = []
     for shard in manifest['shards']:
         slice_id = int(shard['sliceId'])
+        mask = int(shard['mask'])
         offsets = shard['bucketOffsets']
-        for bucket_id in sorted({_bucket(g['Sequence'], slice_id, manifest['layout']) for g in guides}):
+        entry_counts = shard['bucketEntryCounts']
+
+        bucket_ids = sorted({
+            _masked_bucket(guide['Sequence'], mask)
+            for guide in guides
+        })
+
+        for bucket_id in bucket_ids:
             prefix = f'{genome}/issl/cache/slices/{slice_id}/buckets/{bucket_id}'
             manifest_key = f'{prefix}/manifest.json'
+
             selected.append({
-                'sliceId': slice_id, 'bucketId': bucket_id,
-                'startByte': int(offsets[bucket_id]), 'endByte': int(offsets[bucket_id + 1]),
-                'cachePrefix': prefix, 'manifestKey': manifest_key,
-                'cached': _json(manifest_key) is not None,
+                'sliceId': slice_id,
+                'bucketId': bucket_id,
+                'startByte': int(offsets[bucket_id]),
+                'endByte': int(offsets[bucket_id + 1]),
+                'elementCount': int(entry_counts[bucket_id]),
+                'cachePrefix': prefix,
+                'manifestKey': manifest_key,
+                'cached': _valid_cached_bucket(
+                manifest_key,
+                slice_id,
+                bucket_id,
+                manifest['layout'],
+            ),
             })
+
     return selected
 
 
 def _extraction_bucket_budget(allocation):
-    catalogue_part_bytes = (
-        _ceil_div(allocation['offtargetsCount'], allocation['extractorCount'])
-        * CATALOGUE_RECORD_BYTES
-    )
-    # Reserve raw bucket bytes plus up to twice their size for extracted output.
-    # This limits batches conservatively: buckets are actually processed one at a time.
-    return max(0, (EXTRACTOR_SAFE_BYTES - catalogue_part_bytes) // 3)
-
+    return EXTRACTOR_SAFE_BYTES
 
 def _partition_extraction_guides(guides, genome, manifest):
     """Bound cumulative raw bucket work, reusing cache checks within this event."""
     guides = sorted(guides, key=lambda item: int(item['TargetID']))
     selected = _selected_buckets(guides, genome, manifest)
     by_bucket = {(item['sliceId'], item['bucketId']): item for item in selected}
+    record_bytes = int(manifest['layout']['hydratedRecordBytes'])
+
+    bucket_work_bytes = {
+        key: (
+            int(bucket['endByte']) - int(bucket['startByte'])
+            + int(bucket['elementCount']) * record_bytes
+        )
+        for key, bucket in by_bucket.items()
+    }
     allocation = None
     budget = 0
     if any(not item['cached'] for item in selected):
@@ -292,20 +357,23 @@ def _partition_extraction_guides(guides, genome, manifest):
     for guide in guides:
         guide_keys = {
             (int(shard['sliceId']),
-             _bucket(guide['Sequence'], int(shard['sliceId']), manifest['layout']))
+             _masked_bucket(guide['Sequence'], shard['mask']))
             for shard in manifest['shards']
         }
         added_bytes = sum(
-            int(by_bucket[key]['endByte']) - int(by_bucket[key]['startByte'])
-            for key in guide_keys - keys if not by_bucket[key]['cached']
+            bucket_work_bytes[key]
+            for key in guide_keys - keys
+            if not by_bucket[key]['cached']
         )
+
         if group and (missing_bytes + added_bytes > budget
                       or len(group) >= MAX_EXTRACTION_GUIDES):
             yield group, [by_bucket[key] for key in sorted(keys)], allocation
             group, keys, missing_bytes = [], set(), 0
             added_bytes = sum(
-                int(by_bucket[key]['endByte']) - int(by_bucket[key]['startByte'])
-                for key in guide_keys if not by_bucket[key]['cached']
+                bucket_work_bytes[key]
+                for key in guide_keys - keys
+                if not by_bucket[key]['cached']
             )
         # A single guide may exceed the work budget: keep it whole and let the
         # existing per-extractor storage feasibility check decide if it can run.
@@ -352,33 +420,55 @@ def _dispatch_group(guides, genome, manifest, selected=None, allocation=None):
     batch_key = f'{prefix}/batch.json'
     count = int(manifest['layout']['offtargetsCount'])
     batch = {
-        'schemaVersion': 1,
         'batchId': batch_id,
         'expectedParts': extractor_count,
         'offtargetsCount': count,
         'missingBuckets': missing,
         'mapperTasks': mapper_tasks,
     }
+    tasks = []
+
+    layout = manifest['layout']
+    record_bytes = int(layout['hydratedRecordBytes'])
+    batch.update({
+        'schemaVersion': 2,
+        'idBits': int(layout['idBits']),
+        'hydratedRecordBytes': record_bytes,
+    })
+
     s3.put_object(Bucket=BUCKET, Key=batch_key,
                   Body=json.dumps(batch, separators=(',', ':')).encode(),
                   ContentType='application/json')
-    catalogue_start = 48 + int(manifest['layout']['scoresCount']) * 16
-    tasks = []
+
     for part_id in range(extractor_count):
         start_id = part_id * count // extractor_count
         end_id = (part_id + 1) * count // extractor_count
         tasks.append({
-            'schemaVersion': 1, 'batchId': batch_id, 'batchKey': batch_key,
-            'partId': part_id, 'expectedParts': extractor_count,
+            'schemaVersion': 2,
+            'batchId': batch_id,
+            'batchKey': batch_key,
+            'partId': part_id,
+            'expectedParts': extractor_count,
+            'offtargetsCount': count,
             'idRange': {'start': start_id, 'end': end_id},
+            'idBits': int(layout['idBits']),
+            'hydratedRecordBytes': record_bytes,
             'catalogue': {
                 'bucket': manifest['issl']['bucket'],
                 'key': manifest['issl']['key'],
-                'startByte': catalogue_start + start_id * 8,
-                'endByte': catalogue_start + end_id * 8,
+                'signatures': {
+                    'startByte': int(layout['signatureOffsetBytes']) + 5 * start_id,
+                    'endByte': int(layout['signatureOffsetBytes']) + 5 * end_id,
+                },
+                'occurrences': {
+                    'startByte': int(layout['occurrenceOffsetBytes']) + 4 * start_id,
+                    'endByte': int(layout['occurrenceOffsetBytes']) + 4 * end_id,
+                },
             },
-            'buckets': missing, 'completionPrefix': f'{prefix}/parts',
+            'buckets': missing,
+            'completionPrefix': f'{prefix}/parts',
         })
+
     _send(EXTRACTOR_QUEUE, tasks)
 
 
@@ -396,7 +486,7 @@ def lambda_handler(event, context):
     batches = 0
     for (_, genome), guides_by_id in grouped.items():
         manifest = _json(f'{genome}/issl/shards.json')
-        if not manifest or manifest.get('schemaVersion') != 2:
+        if not manifest or manifest.get('schemaVersion') != 3:
             raise ValueError('Missing or unsupported ISSL shard manifest')
         guides = sorted(guides_by_id.values(), key=lambda item: int(item['TargetID']))
         for group, selected, allocation in _partition_extraction_guides(guides, genome, manifest):
