@@ -39,46 +39,60 @@ def _read_s3_range(key, start, length):
 
 def _read_issl_layout(key, file_bytes):
     """
-    Read the newly built matching-format ISSL index and produce:
+    Read the compressed matching-format ISSL index from S3.
+    Returns:
+        layout:
+            Metadata required to download catalogue partitions and interpret
+            hydrated candidate records. This includes the global off-target
+            count, signature/occurrence offsets, overflow-table location, and
+            the selected 32- or 64-bit global-ID contract.
 
-        layout: global catalogue metadata and hydrated-record ID contract
-        shards: one entry per ISSL slice, including its real mask, bucket
-                entry counts, and absolute byte offsets for each compressed
-                bucket stream.
+        shards:
+            One dictionary per ISSL slice. Each shard contains its mask,
+            decoded bucket-entry counts, and absolute S3 byte offsets for the
+            compressed LEB128 bucket streams.
 
-    On-disk matching-format ISSL structure, all little-endian:
+    Layout, little-endian:
 
-        Header
-            uint64 N                 unique off-target count
-            uint64 sequenceLength    expected to be 20
-            uint64 sliceCount
+        3 x uint64
+            N, sequence length, and slice count.
 
-        Global catalogue
-            N x 5 bytes              packed 40-bit off-target signatures
-            N x uint32               occurrence counts
+        N x 5-byte signatures
+            One packed 40-bit signature per unique off-target.
 
-        Slice masks
-            sliceCount x uint64      position masks
+        N x uint8 occurrence bytes
+            Counts 1-254 are stored directly. A value of 255 indicates that
+            the full uint32 count is stored in the overflow table.
 
-        For each slice:
-            B x uint64               bucket decoded-entry counts
-            B x uint64               bucket compressed-byte counts
-            uint64                   total compressed payload bytes
-            B contiguous byte streams
-                                    each is LEB128 delta-encoded global IDs
+        uint64 overflow count
 
-        B is determined separately for each slice:
+        overflow count x 16-byte entries
+            Each entry is: uint64 global ID, uint32 occurrence count, and
+            four bytes of x86-64 struct padding.
 
-            B = 1 << (2 * popcount(mask))
+        slice count x uint64 masks
 
-    A bucket stream starts with an absolute global ID. Each later LEB128
-    value is a positive delta from the preceding ID. The resulting global ID
-    indexes both global catalogue arrays above.
+        Per slice:
+            B x uint64 decoded bucket-entry counts
+            B x uint64 compressed bucket-byte counts
+            1 x uint64 total compressed payload bytes
+            B contiguous LEB128 delta-encoded global-ID streams
 
-    This function reads the real masks and
-    derives each slice's bucket layout from its own mask.
+    B is calculated independently for each slice:
+
+        B = 1 << (2 * popcount(mask))
+
+    Each bucket begins with an absolute global ID. Later LEB128 values are
+    positive deltas from the previous ID. The resulting IDs index the
+    signature and occurrence arrays. This function validates the declared
+    byte ranges and returns absolute offsets suitable for S3 range requests.
     """
+    def checked_span(start, length):
+        if start < 0 or length < 0 or start > file_bytes - length:
+            raise ValueError('Index region exceeds object size')
+
     def words(start, count):
+        checked_span(start, count * 8)
         data = _read_s3_range(key, start, count * 8)
         return struct.unpack(f'<{count}Q', data)
 
@@ -91,7 +105,13 @@ def _read_issl_layout(key, file_bytes):
 
     signature_offset = 24
     occurrence_offset = signature_offset + 5 * n
-    mask_offset = occurrence_offset + 4 * n
+    overflow_count_offset = occurrence_offset + n
+    overflow_count, = words(overflow_count_offset, 1)
+    if overflow_count > n:
+        raise ValueError('More overflow entries than catalogue records')
+    overflow_offset = overflow_count_offset + 8
+    checked_span(overflow_offset, overflow_count * 16)
+    mask_offset = overflow_offset + overflow_count * 16
     masks = words(mask_offset, slice_count)
     cursor = mask_offset + 8 * slice_count
 
@@ -132,14 +152,17 @@ def _read_issl_layout(key, file_bytes):
     if cursor != file_bytes:
         raise ValueError('Unexpected trailing bytes in matching-format index')
     return {
-        'format': 'delta-catalogue-v1',
+        'format': 'delta-catalogue-v2',
         'offtargetsCount': n,
         'sequenceLength': sequence_length,
         'sliceCount': slice_count,
         'signatureOffsetBytes': signature_offset,
         'signatureRecordBytes': 5,
         'occurrenceOffsetBytes': occurrence_offset,
-        'occurrenceRecordBytes': 4,
+        'occurrenceRecordBytes': 1,
+        'overflowOffsetBytes': overflow_offset,
+        'overflowCount': overflow_count,
+        'overflowRecordBytes': 16,
         **contract,
     }, shards
 
@@ -183,7 +206,7 @@ def _process_job(message):
     file_bytes = s3_client.head_object(Bucket=BUCKET, Key=issl_key)['ContentLength']
     layout, shards = _read_issl_layout(issl_key, file_bytes)
     audit_document = {
-        'schemaVersion': 3,
+        'schemaVersion': 4,
         'jobId': job_id,
         'genome': genome,
         'maxDistance': MAX_DISTANCE,

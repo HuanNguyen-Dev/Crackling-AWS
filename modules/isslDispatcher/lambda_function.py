@@ -18,8 +18,6 @@ SCORE_METHOD = os.getenv('SCORE_METHOD', 'and')
 s3 = boto3.client('s3')
 sqs = boto3.client('sqs')
 
-CATALOGUE_RECORD_BYTES = 9
-
 if min(MAX_EXTRACTORS, EXTRACTOR_SAFE_BYTES, MAPPER_SAFE_BYTES, MAX_EXTRACTION_GUIDES) < 1:
     raise ValueError('Extractor limits and maximum guide batch size must be positive')
 
@@ -51,13 +49,17 @@ def _largest_manifest_bucket(manifest):
             largest = max(largest, end - start)
     return largest
 
+def _catalogue_partition_bytes(partition_records, overflow_count):
+    return 6 * partition_records + 16 * min(overflow_count, partition_records)
+
 
 def _extractor_allocation(manifest):
     """Choose stable ID partitions using immutable, whole-ISSL metadata."""
     layout = manifest['layout']
     offtarget_count = int(layout['offtargetsCount'])
+    overflow_count = int(layout['overflowCount'])
+    catalogue_bytes = 6 * offtarget_count + 16 * overflow_count
     hydrated_record_bytes = int(layout['hydratedRecordBytes'])
-    catalogue_bytes = offtarget_count * CATALOGUE_RECORD_BYTES
     largest_bucket_bytes = _largest_manifest_bucket(manifest)
 
     max_extractor_count = max(
@@ -69,7 +71,7 @@ def _extractor_allocation(manifest):
 
     for extractor_count in range(1, max_extractor_count + 1):
         partition_records = _ceil_div(offtarget_count, extractor_count)
-        catalogue_part_bytes = partition_records * CATALOGUE_RECORD_BYTES
+        catalogue_part_bytes = _catalogue_partition_bytes(partition_records,overflow_count)
 
         bucket_working_bytes = max((
             int(bucket_end) - int(bucket_start)
@@ -94,6 +96,7 @@ def _extractor_allocation(manifest):
         'extractorCount': extractor_count,
         'requiredExtractors': required,
         'offtargetsCount': offtarget_count,
+        'overflowCount': overflow_count,
         'catalogueBytes': catalogue_bytes,
         'largestIsslBucketBytes': largest_bucket_bytes,
         'hydratedRecordBytes': hydrated_record_bytes,
@@ -105,15 +108,11 @@ def _check_selected_bucket_feasibility(missing, allocation):
         default=0,
     )
     extractor_count = allocation['extractorCount']
-    catalogue_part_bytes = (
-        _ceil_div(allocation['offtargetsCount'], extractor_count)
-        * CATALOGUE_RECORD_BYTES
-    )
-
     partition_records = _ceil_div(
         allocation['offtargetsCount'],
         allocation['extractorCount'],
     )
+    catalogue_part_bytes = _catalogue_partition_bytes(partition_records, int(allocation['overflowCount']))
 
     bucket_working_bytes = max((
     int(bucket['endByte']) - int(bucket['startByte']) + min(int(bucket['elementCount']), partition_records) * allocation['hydratedRecordBytes']
@@ -221,6 +220,7 @@ def _mapper_tasks(guides, genome, manifest, selected):
             'jobId': job_id, 'genome': genome, 'guides': contracts,
             'shardId': int(shard['shardId']), 'shardCount': len(shards),
             'sliceId': slice_id, 'buckets': bucket_refs,
+            'sliceIds': [int(item['sliceId']) for item in shards],
             'idBits': int(manifest['layout']['idBits']),
             'hydratedRecordBytes': int(manifest['layout']['hydratedRecordBytes']),
             'scoring': {
@@ -431,7 +431,7 @@ def _dispatch_group(guides, genome, manifest, selected=None, allocation=None):
     layout = manifest['layout']
     record_bytes = int(layout['hydratedRecordBytes'])
     batch.update({
-        'schemaVersion': 2,
+        'schemaVersion': 3,
         'idBits': int(layout['idBits']),
         'hydratedRecordBytes': record_bytes,
     })
@@ -444,7 +444,7 @@ def _dispatch_group(guides, genome, manifest, selected=None, allocation=None):
         start_id = part_id * count // extractor_count
         end_id = (part_id + 1) * count // extractor_count
         tasks.append({
-            'schemaVersion': 2,
+            'schemaVersion': 3,
             'batchId': batch_id,
             'batchKey': batch_key,
             'partId': part_id,
@@ -461,8 +461,15 @@ def _dispatch_group(guides, genome, manifest, selected=None, allocation=None):
                     'endByte': int(layout['signatureOffsetBytes']) + 5 * end_id,
                 },
                 'occurrences': {
-                    'startByte': int(layout['occurrenceOffsetBytes']) + 4 * start_id,
-                    'endByte': int(layout['occurrenceOffsetBytes']) + 4 * end_id,
+                    'startByte': int(layout['occurrenceOffsetBytes']) + start_id,
+                    'endByte': int(layout['occurrenceOffsetBytes']) + end_id,
+                },
+                'overflow': {
+                    'startByte': int(layout['overflowOffsetBytes']),
+                    'endByte': int(layout['overflowOffsetBytes'])
+                            + 16 * int(layout['overflowCount']),
+                    'recordCount': int(layout['overflowCount']),
+                    'recordBytes': 16,
                 },
             },
             'buckets': missing,
@@ -486,7 +493,7 @@ def lambda_handler(event, context):
     batches = 0
     for (_, genome), guides_by_id in grouped.items():
         manifest = _json(f'{genome}/issl/shards.json')
-        if not manifest or manifest.get('schemaVersion') != 3:
+        if not manifest or manifest.get('schemaVersion') != 4:
             raise ValueError('Missing or unsupported ISSL shard manifest')
         guides = sorted(guides_by_id.values(), key=lambda item: int(item['TargetID']))
         for group, selected, allocation in _partition_extraction_guides(guides, genome, manifest):

@@ -35,6 +35,15 @@ def _process(message):
     batch = _json(message['batchKey'])
     if not batch:
         raise ValueError('Extraction batch document is missing')
+    if batch.get('schemaVersion') != 3:
+        raise ValueError('Unsupported extraction batch schemaVersion')
+    id_bits = int(batch['idBits'])
+    if id_bits not in (32, 64):
+        raise ValueError('Unsupported global ID width')
+    record_bytes = 20 if id_bits == 64 else 16
+    if int(batch['hydratedRecordBytes']) != record_bytes:
+        raise ValueError('Batch hydrated-record width does not match ID width')
+
     dispatched_key = message['batchKey'].removesuffix('batch.json') + 'dispatched.json'
     if _json(dispatched_key) is not None:
         return True
@@ -44,7 +53,8 @@ def _process(message):
         marker = _json(f'{message["completionPrefix"]}/{part_id}/result.json')
         if marker is None:
             return False
-        if (marker.get('batchId') != batch['batchId']
+        if (marker.get('schemaVersion') != 2
+                or marker.get('batchId') != batch['batchId']
                 or int(marker.get('partId', -1)) != part_id
                 or int(marker.get('expectedParts', -1)) != expected_parts):
             raise ValueError('Extractor completion marker does not match its batch')
@@ -52,35 +62,92 @@ def _process(message):
 
     for bucket in batch['missingBuckets']:
         fragments = []
+
         for part in parts:
-            fragment = next(item for item in part['buckets']
-                            if int(item['sliceId']) == int(bucket['sliceId'])
-                            and int(item['bucketId']) == int(bucket['bucketId']))
+            try:
+                fragment = next(
+                    item for item in part['buckets']
+                    if int(item['sliceId']) == int(bucket['sliceId'])
+                    and int(item['bucketId']) == int(bucket['bucketId'])
+                )
+            except StopIteration:
+                raise ValueError(
+                    'Extractor completion marker is missing a required bucket'
+                )
             fragments.append(fragment)
+
         fragments.sort(key=lambda item: int(item['startId']))
+
         next_id = 0
+        hydrated_records = 0
+
         for fragment in fragments:
-            if int(fragment['startId']) != next_id:
-                raise ValueError('Extractor fragments do not form contiguous ID ranges')
-            next_id = int(fragment['endId'])
+            start_id = int(fragment['startId'])
+            end_id = int(fragment['endId'])
+            fragment_count = int(fragment['recordCount'])
+
+            if start_id != next_id or end_id < start_id:
+                raise ValueError(
+                    'Extractor fragments do not form contiguous ID ranges'
+                )
+
+            if (int(fragment['idBits']) != id_bits
+                    or int(fragment['recordBytes']) != record_bytes):
+                raise ValueError(
+                    'Extractor fragment format does not match its batch'
+                )
+
+            if fragment_count < 0:
+                raise ValueError('Extractor fragment has a negative record count')
+
+            if fragment_count and not fragment.get('key'):
+                raise ValueError('Non-empty extractor fragment has no S3 key')
+
+            next_id = end_id
+            hydrated_records += fragment_count
+
         if next_id != int(batch['offtargetsCount']):
-            raise ValueError('Extractor fragments do not cover the off-target catalogue')
+            raise ValueError(
+                'Extractor fragments do not cover the off-target catalogue'
+            )
+
+        if hydrated_records != int(bucket['elementCount']):
+            raise ValueError(
+                'Hydrated record count does not match the compressed bucket count'
+            )
+
         manifest = {
-            'schemaVersion': 1, 'sliceId': bucket['sliceId'], 'bucketId': bucket['bucketId'],
-            'recordFormat': {'endianness': 'little', 'recordBytes': 16,
-                             'fields': ['signature:uint64', 'globalId:uint32', 'occurrences:uint32']},
-            'recordCount': sum(int(item['recordCount']) for item in fragments),
+            'schemaVersion': 2,
+            'sliceId': bucket['sliceId'],
+            'bucketId': bucket['bucketId'],
+            'idBits': id_bits,
+            'recordFormat': {
+                'endianness': 'little',
+                'packing': 'packed',
+                'recordBytes': record_bytes,
+                'fields': [
+                    'signature:uint64',
+                    f'globalId:uint{id_bits}',
+                    'occurrences:uint32',
+                ],
+            },
+            'recordCount': hydrated_records,
             'parts': fragments,
         }
-        s3.put_object(Bucket=BUCKET, Key=bucket['manifestKey'],
-                      Body=json.dumps(manifest, separators=(',', ':')).encode(),
-                      ContentType='application/json')
+
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=bucket['manifestKey'],
+            Body=json.dumps(manifest, separators=(',', ':')).encode(),
+            ContentType='application/json',
+        )
+
     _send(batch['mapperTasks'])
     s3.put_object(Bucket=BUCKET, Key=dispatched_key,
-                  Body=json.dumps({'schemaVersion': 1,
-                                   'batchId': batch['batchId']},
-                                  separators=(',', ':')).encode(),
-                  ContentType='application/json')
+                    Body=json.dumps({'schemaVersion': 1,
+                                    'batchId': batch['batchId']},
+                                    separators=(',', ':')).encode(),
+                    ContentType='application/json')
     return True
 
 

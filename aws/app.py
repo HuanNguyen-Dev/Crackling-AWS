@@ -680,7 +680,6 @@ class CracklingStack(Stack):
             environment={
                 'TARGETS_TABLE': ddbTargets.table_name,
                 'TASK_TRACKING_TABLE': ddbTaskTracking.table_name,
-                'SHARD_COUNT': '5'
             }
         )
         lambdaIsslReducer.add_to_role_policy(policyAccessS3GenomeBucket)

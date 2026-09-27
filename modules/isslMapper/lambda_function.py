@@ -13,21 +13,27 @@ from botocore.exceptions import ClientError
 MAPPER_BINARY_SOURCE = '/opt/mapper'
 MAPPER_BINARY = '/tmp/mapper'
 COPY_CHUNK_BYTES = 8 * 1024 * 1024
-MAPPER_RESULT = struct.Struct('<QI4xdd')
-SCORE_RESULT = struct.Struct('<Id')
+MAPPER_RESULTS = {
+    32: struct.Struct('<QI4xdd'),
+    64: struct.Struct('<QQdd'),
+}
+SCORE_RESULTS = {
+    32: struct.Struct('<Id'),
+    64: struct.Struct('<Qd'),
+}
 
 s3_client = boto3.client('s3')
 
 
 def _parse_task(record):
     task = json.loads(record['body'])
-    if task.get('schemaVersion') != 5:
+    if task.get('schemaVersion') != 6:
         raise ValueError('Unsupported or missing Mapper task schemaVersion')
 
     required = (
         'batchId', 'jobId', 'guides', 'genome',
-        'shardId', 'shardCount', 'sliceId', 'buckets',
-        'scoringMetadata', 'output',
+        'shardId', 'shardCount', 'sliceId', 'sliceIds', 'buckets',
+        'idBits', 'hydratedRecordBytes', 'scoring', 'output',
     )
     for field in required:
         if field not in task:
@@ -35,6 +41,23 @@ def _parse_task(record):
 
     if not task['guides']:
         raise ValueError('Mapper task must contain at least one guide')
+
+    try:
+        id_bits = int(task['idBits'])
+        record_bytes = int(task['hydratedRecordBytes'])
+        slice_ids = [int(value) for value in task['sliceIds']]
+    except (TypeError, ValueError) as error:
+        raise ValueError('Mapper task has invalid width or slice metadata') from error
+    if id_bits not in MAPPER_RESULTS or record_bytes != 12 + id_bits // 8:
+        raise ValueError('Mapper task hydrated-record width does not match ID width')
+    if (len(slice_ids) != int(task['shardCount']) or not slice_ids
+            or len(set(slice_ids)) != len(slice_ids)
+            or int(task['sliceId']) not in slice_ids
+            or int(task['shardId']) != int(task['sliceId'])):
+        raise ValueError('Mapper task has invalid slice set')
+    task['idBits'] = id_bits
+    task['hydratedRecordBytes'] = record_bytes
+    task['sliceIds'] = slice_ids
 
     target_ids = set()
     for guide in task['guides']:
@@ -108,14 +131,15 @@ def _write_mapper_inputs(task, guides, bucket_plans, directory):
             ''.join(f'{guide["guideSequence"]}\n' for guide in guides)
         )
     with open(shard_path, 'w', newline='\n') as shard_file:
-        shard_file.write(
-            f'{task["shardId"]} {task["sliceId"]} {len(bucket_plans)}\n'
-        )
+        shard_file.write(f'{task["shardId"]} {task["sliceId"]} {len(bucket_plans)}\n')
         for plan in bucket_plans:
             shard_file.write(
                 f'{plan["bucketId"]} {plan["compactOffset"]} '
                 f'{plan["elementCount"]}\n'
             )
+        shard_file.write(f'{len(guides)}\n')
+        for guide in guides:
+            shard_file.write(f'{guide["bucketId"]}\n')
     return query_path, shard_path
 
 
@@ -127,7 +151,7 @@ def _sequence_to_signature(sequence):
     return signature
 
 
-def _split_results(combined_path, guides, directory):
+def _split_results(combined_path, guides, directory, id_bits):
     results = {}
     signatures = {}
     for guide in guides:
@@ -150,14 +174,17 @@ def _split_results(combined_path, guides, directory):
             }
             for target_id, result in results.items()
         }
+        mapper_result = MAPPER_RESULTS[id_bits]
+        score_result = SCORE_RESULTS[id_bits]
+        missing_id = (1 << id_bits) - 1
         while True:
-            record = combined.read(MAPPER_RESULT.size)
+            record = combined.read(mapper_result.size)
             if not record:
                 break
-            if len(record) != MAPPER_RESULT.size:
+            if len(record) != mapper_result.size:
                 raise ValueError('Mapper produced a truncated binary record')
             query_signature, offtarget_id, mit_score, cfd_score = (
-                MAPPER_RESULT.unpack(record)
+                mapper_result.unpack(record)
             )
             if query_signature not in signatures:
                 raise ValueError(
@@ -166,35 +193,35 @@ def _split_results(combined_path, guides, directory):
             for target_id in signatures[query_signature]:
                 result = results[target_id]
                 result['mapperRecords'] += 1
-                if offtarget_id == 0xFFFFFFFF:
+                if offtarget_id == missing_id:
                     continue
                 if mit_score != 0.0:
                     outputs[target_id]['mit'].write(
-                        SCORE_RESULT.pack(offtarget_id, mit_score)
+                        score_result.pack(offtarget_id, mit_score)
                     )
                     result['mitRecords'] += 1
                 if cfd_score != 0.0:
                     outputs[target_id]['cfd'].write(
-                        SCORE_RESULT.pack(offtarget_id, cfd_score)
+                        score_result.pack(offtarget_id, cfd_score)
                     )
                     result['cfdRecords'] += 1
     return results
 
 
-def _run_mapper(task, directory, issl_path, query_path, shard_path):
+def _run_mapper(task, directory, query_path, shard_path):
     scoring = task.get('scoring', {})
     # The local C++ implementation prefixes its per-thread temporary names,
     # so this must remain a simple filename rather than an absolute path.
     output_prefix = 'result'
     command = [
         MAPPER_BINARY,
-        issl_path,
+        os.path.join(directory, 'candidates.bin'),
         query_path,
+        shard_path,
+        str(task['idBits']),
         str(scoring.get('maxDistance', 4)),
         str(scoring.get('scoreThreshold', 75)),
         str(scoring.get('scoreMethod', 'and')),
-        os.path.join(directory, 'candidates.bin'),
-        shard_path,
         output_prefix,
     ]
     completed = subprocess.run(
@@ -254,19 +281,29 @@ def _materialize_candidates(task, directory):
     with open(path, 'wb') as output:
         for bucket in sorted(task['buckets'], key=lambda item: int(item['bucketId'])):
             manifest = _read_json(task['output']['bucket'], bucket['manifestKey'])
-            if (manifest.get('schemaVersion') != 1
+            if (manifest.get('schemaVersion') != 2
                     or int(manifest['sliceId']) != int(task['sliceId'])
                     or int(manifest['bucketId']) != int(bucket['bucketId'])):
                 raise ValueError('Invalid hydrated bucket manifest')
             offset = output.tell()
             count = 0
+            if manifest.get('recordFormat', {}).get('endianness') != 'little':
+                raise ValueError('Hydrated bucket manifest must be little-endian')
+            if manifest['recordFormat'].get('packing') != 'packed':
+                raise ValueError('Hydrated bucket manifest must be packed')
             record_bytes = int(manifest['recordFormat']['recordBytes'])
             if (int(manifest['idBits']) != int(task['idBits'])
-                    or record_bytes != int(task['hydratedRecordBytes'])):
+                    or record_bytes != int(task['hydratedRecordBytes'])
+                    or record_bytes != 12 + int(task['idBits']) // 8):
                 raise ValueError('Hydrated bucket width does not match Mapper task')
+
             for part in sorted(manifest['parts'], key=lambda item: int(item['startId'])):
                 part_count = int(part['recordCount'])
+                if part_count < 0:
+                    raise ValueError('Hydrated candidate part has negative record count')
                 if part_count:
+                    if not part.get('key'):
+                        raise ValueError('Non-empty hydrated candidate part has no key')
                     part_offset = output.tell()
                     _download_object(task['output']['bucket'], part['key'], output)
                     if output.tell() - part_offset != part_count * record_bytes:
@@ -275,18 +312,13 @@ def _materialize_candidates(task, directory):
                 fragment_count += 1
 
             if output.tell() - offset != count * record_bytes:
-                raise ValueError('Hydrated candidate bytes do not match manifest')    
-                
+                raise ValueError('Hydrated candidate bytes do not match manifest')
+            if count != int(manifest['recordCount']):
+                raise ValueError('Hydrated candidate count does not match manifest')
+
             plans.append({'bucketId': int(bucket['bucketId']),
                           'compactOffset': offset, 'elementCount': count})
     return path, plans, fragment_count
-
-
-def _materialize_scoring_metadata(task, path):
-    source = task['scoringMetadata']
-    with open(path, 'w+b') as output:
-        return _copy_s3_range(source['bucket'], source['key'], 0,
-                              int(source['endByte']), output, 0)
 
 
 def _process(task):
@@ -306,18 +338,19 @@ def _process(task):
         os.chmod(MAPPER_BINARY, 0o755)
 
     with tempfile.TemporaryDirectory(dir='/tmp') as directory:
-        issl_path = os.path.join(directory, 'scoring-metadata.bin')
-        prefix_bytes = _materialize_scoring_metadata(task, issl_path)
         _, bucket_plans, fragment_count = _materialize_candidates(task, directory)
-        bucket_bytes = sum(plan['elementCount'] * 16 for plan in bucket_plans)
+        bucket_bytes = sum(
+            plan['elementCount'] * task['hydratedRecordBytes']
+            for plan in bucket_plans
+        )
         query_path, shard_path = _write_mapper_inputs(
             task, guides, bucket_plans, directory,
         )
         combined_path = _run_mapper(
-            task, directory, issl_path, query_path, shard_path,
+            task, directory, query_path, shard_path,
         )
         results = _split_results(
-            combined_path, guides, directory,
+            combined_path, guides, directory, task['idBits'],
         )
         for guide in guides:
             result = results[guide['targetId']]
@@ -333,8 +366,8 @@ def _process(task):
                 'shardCount': task['shardCount'],
                 'recordFormat': {
                     'endianness': 'little',
-                    'fields': ['targetId:uint32', 'score:float64'],
-                    'recordBytes': SCORE_RESULT.size,
+                    'fields': [f'targetId:uint{task["idBits"]}', 'score:float64'],
+                    'recordBytes': SCORE_RESULTS[task['idBits']].size,
                 },
                 'records': {
                     'mapper': result['mapperRecords'],
@@ -342,9 +375,10 @@ def _process(task):
                     'cfd': result['cfdRecords'],
                 },
                 'materializedBytes': {
-                    'indexPrefix': prefix_bytes,
                     'selectedBuckets': bucket_bytes,
                 },
+                'idBits': task['idBits'],
+                'sliceIds': task['sliceIds'],
                 'selectedBucketIds': [plan['bucketId'] for plan in bucket_plans],
                 'fragmentCount': fragment_count,
                 'outputs': {

@@ -13,13 +13,12 @@ import boto3
 from botocore.exceptions import ClientError
 
 
-SHARD_COUNT = int(os.getenv('SHARD_COUNT', '5'))
 TRANSACTION_MAX_ATTEMPTS = 5
 TRANSACTION_BACKOFF_BASE_SECONDS = 0.05
 TRANSACTION_BACKOFF_MAX_SECONDS = 1.0
 TARGETS_TABLE = os.getenv('TARGETS_TABLE')
 TASK_TRACKING_TABLE = os.getenv('TASK_TRACKING_TABLE')
-SCORE_RECORD = struct.Struct('<Id')
+SCORE_RECORDS = {32: struct.Struct('<Id'), 64: struct.Struct('<Qd')}
 MAPPER_MARKER_PATTERN = re.compile(
     r'^(?P<genome>.+)/mapper/(?P<job_id>[^/]+)/targets/'
     r'(?P<target_id>\d+)/shards/(?P<shard_id>\d+)/mapper-result\.json$'
@@ -74,9 +73,25 @@ def _marker_key(trigger, shard_id):
     )
 
 
+def _marker_contract(trigger):
+    marker = _get_json(trigger['bucket'], trigger['key'])
+    try:
+        slice_ids = [int(value) for value in marker['sliceIds']]
+        id_bits = int(marker['idBits'])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError('Mapper marker has invalid slice or ID-width metadata') from error
+    if (id_bits not in SCORE_RECORDS or not slice_ids
+            or len(set(slice_ids)) != len(slice_ids)
+            or trigger['shardId'] not in slice_ids
+            or int(marker.get('shardCount', -1)) != len(slice_ids)):
+        raise ValueError('Mapper marker has invalid slice set')
+    return slice_ids, id_bits
+
+
 def _load_all_markers(trigger):
+    slice_ids, id_bits = _marker_contract(trigger)
     markers = []
-    for shard_id in range(SHARD_COUNT):
+    for shard_id in slice_ids:
         marker = _get_json(
             trigger['bucket'],
             _marker_key(trigger, shard_id),
@@ -89,7 +104,9 @@ def _load_all_markers(trigger):
             'targetId': trigger['targetId'],
             'genome': trigger['genome'],
             'shardId': shard_id,
-            'shardCount': SHARD_COUNT,
+            'shardCount': len(slice_ids),
+            'sliceIds': slice_ids,
+            'idBits': id_bits,
         }
         for field, value in expected.items():
             if marker.get(field) != value:
@@ -98,17 +115,18 @@ def _load_all_markers(trigger):
                     f'{marker.get(field)!r}'
                 )
         markers.append(marker)
-    return markers
+    return markers, slice_ids, id_bits
 
 
 def _create_score_table(connection, score_name):
     connection.execute(
         f'CREATE TABLE {score_name} ('
-        'target_id INTEGER PRIMARY KEY, score REAL NOT NULL)'
+        'target_id BLOB PRIMARY KEY, score REAL NOT NULL)'
     )
 
 
-def _read_score_records(bucket, key):
+def _read_score_records(bucket, key, id_bits):
+    score_record = SCORE_RECORDS[id_bits]
     response = s3_client.get_object(Bucket=bucket, Key=key)
     body = response['Body']
     remainder = b''
@@ -117,22 +135,31 @@ def _read_score_records(bucket, key):
         if not chunk:
             break
         data = remainder + chunk
-        complete_bytes = len(data) - (len(data) % SCORE_RECORD.size)
-        for offset in range(0, complete_bytes, SCORE_RECORD.size):
-            yield SCORE_RECORD.unpack_from(data, offset)
+        complete_bytes = len(data) - (len(data) % score_record.size)
+        for offset in range(0, complete_bytes, score_record.size):
+            yield score_record.unpack_from(data, offset)
         remainder = data[complete_bytes:]
     if remainder:
         raise ValueError(f'Score object {key} contains a truncated record')
 
 
-def _merge_score_object(connection, score_name, bucket, key):
+def _sqlite_global_id(global_id, id_bits):
+    """Make an unsigned ID a stable SQLite primary key at either width."""
+    try:
+        return sqlite3.Binary(struct.pack('<I' if id_bits == 32 else '<Q', global_id))
+    except struct.error as error:
+        raise ValueError('Score record has an invalid global ID') from error
+
+
+def _merge_score_object(connection, score_name, bucket, key, id_bits):
     unique_count = 0
     duplicate_count = 0
-    for target_id, score in _read_score_records(bucket, key):
+    for target_id, score in _read_score_records(bucket, key, id_bits):
+        database_id = _sqlite_global_id(target_id, id_bits)
         cursor = connection.execute(
             f'INSERT OR IGNORE INTO {score_name} (target_id, score) '
             'VALUES (?, ?)',
-            (target_id, score),
+            (database_id, score),
         )
         if cursor.rowcount == 1:
             unique_count += 1
@@ -141,7 +168,7 @@ def _merge_score_object(connection, score_name, bucket, key):
         duplicate_count += 1
         existing = connection.execute(
             f'SELECT score FROM {score_name} WHERE target_id = ?',
-            (target_id,),
+            (database_id,),
         ).fetchone()[0]
         if not math.isclose(existing, score, rel_tol=1e-12, abs_tol=1e-12):
             raise ValueError(
@@ -152,7 +179,7 @@ def _merge_score_object(connection, score_name, bucket, key):
     return unique_count, duplicate_count
 
 
-def _reduce_markers(bucket, markers, database_path):
+def _reduce_markers(bucket, markers, id_bits, database_path):
     connection = sqlite3.connect(database_path)
     try:
         _create_score_table(connection, 'mit')
@@ -167,6 +194,7 @@ def _reduce_markers(bucket, markers, database_path):
                     score_name,
                     bucket,
                     marker['outputs'][score_name],
+                    id_bits,
                 )
                 source_records[score_name] += added + duplicates
                 duplicate_records[score_name] += duplicates
@@ -209,11 +237,12 @@ def _write_json(bucket, key, document):
     )
 
 
-def _reduce(trigger, markers):
+def _reduce(trigger, markers, slice_ids, id_bits):
     with tempfile.TemporaryDirectory(dir='/tmp') as directory:
         reduced = _reduce_markers(
             trigger['bucket'],
             markers,
+            id_bits,
             os.path.join(directory, 'reducer.sqlite3'),
         )
 
@@ -223,7 +252,9 @@ def _reduce(trigger, markers):
         'jobId': trigger['jobId'],
         'targetId': trigger['targetId'],
         'genome': trigger['genome'],
-        'shardCount': SHARD_COUNT,
+        'shardCount': len(slice_ids),
+        'sliceIds': slice_ids,
+        'idBits': id_bits,
     }
     for score_name in ('mit', 'cfd'):
         _write_json(
@@ -344,9 +375,10 @@ def _process_s3_record(record):
     trigger = _mapper_event(record)
     if trigger is None:
         return 'ignored'
-    markers = _load_all_markers(trigger)
-    if markers is None:
+    loaded = _load_all_markers(trigger)
+    if loaded is None:
         return 'waiting'
+    markers, slice_ids, id_bits = loaded
     keys = _result_keys(trigger)
     existing_result = _get_json(
         trigger['bucket'], keys['result'], missing_is_none=True,
@@ -354,7 +386,7 @@ def _process_s3_record(record):
     if existing_result is not None:
         return 'processed'
 
-    result, keys = _reduce(trigger, markers)
+    result, keys = _reduce(trigger, markers, slice_ids, id_bits)
     pipeline_updated = _record_pipeline_completion(
         trigger, result['scores'],
     )
