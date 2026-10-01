@@ -301,20 +301,20 @@ class CracklingStack(Stack):
         sqsIsslMapper = sqs_.Queue(self, "sqsIsslMapper",
             receive_message_wait_time=Duration.seconds(20),
             visibility_timeout=duration,
-            retention_period=Duration.days(4)
+            retention_period=Duration.minutes(30)
         )
 
         sqsIsslCandidateExtractor = sqs_.Queue(
             self, "sqsIsslCandidateExtractor",
             receive_message_wait_time=Duration.seconds(20),
             visibility_timeout=duration,
-            retention_period=Duration.days(4)
+            retention_period=Duration.minutes(30)
         )
         sqsIsslExtractionCompletion = sqs_.Queue(
             self, "sqsIsslExtractionCompletion",
             receive_message_wait_time=Duration.seconds(20),
             visibility_timeout=duration,
-            retention_period=Duration.days(4)
+            retention_period=Duration.minutes(30)
         )
 
         ### Buffer Mapper completion events before reduction.
@@ -323,7 +323,7 @@ class CracklingStack(Stack):
         sqsIsslReducer = sqs_.Queue(self, "sqsIsslReducer",
             receive_message_wait_time=Duration.seconds(20),
             visibility_timeout=duration,
-            retention_period=Duration.days(4)
+            retention_period=Duration.minutes(60)
         )
         
         ### SQS queue for evaluating guide efficiency
