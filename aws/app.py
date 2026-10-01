@@ -547,7 +547,7 @@ class CracklingStack(Stack):
                 'MAX_EXTRACTORS': '50',
                 'EXTRACTOR_SAFE_BYTES': str(8 * 1024 ** 3),
                 'MAPPER_SAFE_BYTES': str(8 * 1024 ** 3),
-                'MAX_GUIDES_PER_EXTRACTION_GROUP': '100',
+                'MAX_GUIDES_PER_EXTRACTION_GROUP': '5000',
                 'MAX_DISTANCE': '4',
                 'SCORE_THRESHOLD': '75',
                 'SCORE_METHOD': 'and'
@@ -559,8 +559,8 @@ class CracklingStack(Stack):
         lambdaIsslDispatcher.add_event_source_mapping(
             "mapLdaIsslSqsIssl",
             event_source_arn=sqsIssl.queue_arn,
-            batch_size=100,
-            max_batching_window=Duration.seconds(5)
+            batch_size=5000,
+            max_batching_window=Duration.seconds(120)
         )
         lambdaIsslDispatcher.add_to_role_policy(policyAccessS3GenomeBucket)
 

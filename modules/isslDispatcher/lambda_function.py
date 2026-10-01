@@ -395,9 +395,6 @@ def _dispatch_group(guides, genome, manifest, selected=None, allocation=None):
     ]
     missing = [{key: value for key, value in item.items() if key != 'cached'}
                for item in selected if not item['cached']]
-    if not missing:
-        _send(MAPPER_QUEUE, mapper_tasks)
-        return
 
     if allocation is None:
         allocation = _extractor_allocation(manifest)
@@ -410,6 +407,7 @@ def _dispatch_group(guides, genome, manifest, selected=None, allocation=None):
     }))
     _check_selected_bucket_feasibility(missing, allocation)
     extractor_count = allocation['extractorCount']
+
     job_id = str(guides[0]['JobID'])
     batch_id = _hash(
         job_id,
@@ -418,6 +416,32 @@ def _dispatch_group(guides, genome, manifest, selected=None, allocation=None):
     )
     prefix = f'{genome}/issl/extractions/{job_id}/{batch_id}'
     batch_key = f'{prefix}/batch.json'
+
+    # All buckets are already cached/hydrated
+    if not missing:
+        mapper_key = f'{prefix}/mapper-plan.json'
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=mapper_key,
+            Body=json.dumps({
+                'schemaVersion': 3,
+                'mapperTasks': mapper_tasks,
+            }, separators=(',',':')).encode(),
+            ContentType='application/json',
+        )
+
+        _send(MAPPER_QUEUE, [
+            {
+                'schemaVersion': 1,
+                'taskType': 'mapperReference',
+                'bucket': BUCKET,
+                'batchKey': mapper_key,
+                'mapperTaskIndex': index,
+            }
+            for index in range(len(mapper_tasks))
+        ])
+        return
+
     count = int(manifest['layout']['offtargetsCount'])
     batch = {
         'batchId': batch_id,
@@ -435,10 +459,6 @@ def _dispatch_group(guides, genome, manifest, selected=None, allocation=None):
         'idBits': int(layout['idBits']),
         'hydratedRecordBytes': record_bytes,
     })
-
-    s3.put_object(Bucket=BUCKET, Key=batch_key,
-                  Body=json.dumps(batch, separators=(',', ':')).encode(),
-                  ContentType='application/json')
 
     for part_id in range(extractor_count):
         start_id = part_id * count // extractor_count
@@ -476,7 +496,22 @@ def _dispatch_group(guides, genome, manifest, selected=None, allocation=None):
             'completionPrefix': f'{prefix}/parts',
         })
 
-    _send(EXTRACTOR_QUEUE, tasks)
+    batch['extractorTasks'] = tasks
+
+    s3.put_object(Bucket=BUCKET, Key=batch_key,
+                Body=json.dumps(batch, separators=(',', ':')).encode(),
+                ContentType='application/json')
+
+    _send(EXTRACTOR_QUEUE, [
+        {
+            'schemaVersion': 1,
+            'taskType': 'extractorReference',
+            'bucket': BUCKET,
+            'batchKey': batch_key,
+            'extractorTaskIndex': index,
+        }
+        for index in range(len(tasks))
+    ])
 
 
 def lambda_handler(event, context):

@@ -27,8 +27,23 @@ s3_client = boto3.client('s3')
 
 def _parse_task(record):
     task = json.loads(record['body'])
-    if task.get('schemaVersion') != 6:
-        raise ValueError('Unsupported or missing Mapper task schemaVersion')
+
+    if task.get('taskType') == 'mapperReference':
+        if task.get('schemaVersion') != 1:
+            raise ValueError('Unsupported or missing Mapper task schemaVersion')
+
+        # Retrieved task from S3
+        batch = _read_json(task['bucket'], task['batchKey'])
+        index = task['mapperTaskIndex']
+        tasks = batch['mapperTasks']
+
+        if type(index) is not int or not 0 <= index < len(tasks):
+            raise ValueError("Invalid mapper task input")
+
+        task = tasks[index]
+
+    if (task.get('schemaVersion')) != 6:
+        raise ValueError("Unsupported or missing Mapper task schemaVersion")
 
     required = (
         'batchId', 'jobId', 'guides', 'genome',

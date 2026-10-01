@@ -174,5 +174,27 @@ def _process(task):
 
 def lambda_handler(event, context):
     for record in event.get('Records', []):
-        _process(json.loads(record['body']))
+        message = json.loads(record['body'])
+
+        if message.get('taskType') == 'extractorReference':
+            if message.get('schemaVersion') != 1:
+                raise ValueError('Unsupported extractor reference version')
+
+            batch = json.loads(s3.get_object(
+                Bucket=message['bucket'],
+                Key=message['batchKey'],
+            )['Body'].read())
+
+            index = message['extractorTaskIndex']
+            tasks = batch['extractorTasks']
+            if type(index) is not int or not 0 <= index < len(tasks):
+                raise ValueError('Invalid extractor task index')
+
+            task = tasks[index]
+        else:
+            # Cached batch.json file
+            task = message
+
+        _process(task)
+
     return {'processed': len(event.get('Records', []))}

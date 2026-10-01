@@ -142,7 +142,17 @@ def _process(message):
             ContentType='application/json',
         )
 
-    _send(batch['mapperTasks'])
+    _send([
+        {
+            'schemaVersion': 1,
+            'taskType': 'mapperReference',
+            'bucket': BUCKET,
+            'batchKey': message['batchKey'],
+            'mapperTaskIndex': index,
+        }
+        for index in range(len(batch['mapperTasks']))
+    ])
+
     s3.put_object(Bucket=BUCKET, Key=dispatched_key,
                     Body=json.dumps({'schemaVersion': 1,
                                     'batchId': batch['batchId']},
