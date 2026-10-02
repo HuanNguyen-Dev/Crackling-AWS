@@ -114,14 +114,14 @@ def _check_selected_bucket_feasibility(missing, allocation):
     )
     catalogue_part_bytes = _catalogue_partition_bytes(partition_records, int(allocation['overflowCount']))
 
-    bucket_working_bytes = max((
-    int(bucket['endByte']) - int(bucket['startByte']) + min(int(bucket['elementCount']), partition_records) * allocation['hydratedRecordBytes']
-    for bucket in missing),
-    default=0)
-
-    estimated_peak_bytes = (
-        catalogue_part_bytes  + bucket_working_bytes
+    bucket_working_bytes = sum(
+    int(bucket['endByte']) - int(bucket['startByte']) 
+    + min(int(bucket['elementCount']), partition_records) 
+    * allocation['hydratedRecordBytes']
+    for bucket in missing
     )
+
+    estimated_peak_bytes = catalogue_part_bytes  + bucket_working_bytes
     details = {
         'extractorCount': extractor_count,
         'requiredExtractors': allocation['requiredExtractors'],
@@ -130,7 +130,7 @@ def _check_selected_bucket_feasibility(missing, allocation):
         'catalogueBytesPerExtractor': catalogue_part_bytes,
         'largestIsslBucketBytes': allocation['largestIsslBucketBytes'],
         'largestSelectedBucketBytes': largest,
-        'largestBucketFootprintBytes': bucket_working_bytes,
+        'stagedBucketFootprintBytes': bucket_working_bytes,
         'estimatedPeakBytesPerExtractor': estimated_peak_bytes,
         'safeLimitBytes': EXTRACTOR_SAFE_BYTES,
         'maxExtractors': MAX_EXTRACTORS,
@@ -140,7 +140,7 @@ def _check_selected_bucket_feasibility(missing, allocation):
         return
 
     reason = (
-        'BUCKET_EXCEEDS_LAMBDA_LIMIT'
+        'TOTAL_BUCKET_EXCEEDS_LAMBDA_LIMIT'
         if bucket_working_bytes >= EXTRACTOR_SAFE_BYTES
         else 'RETRY_WITH_MORE_EXTRACTORS'
     )
@@ -331,7 +331,14 @@ def _selected_buckets(guides, genome, manifest):
 
 
 def _extraction_bucket_budget(allocation):
-    return EXTRACTOR_SAFE_BYTES
+    partition_records = _ceil_div(
+        allocation['offtargetsCount'], allocation['extractorCount']
+    )
+    catalogue_part_bytes = _catalogue_partition_bytes(
+        partition_records, int(allocation['overflowCount'])
+    )
+    return max(0, EXTRACTOR_SAFE_BYTES - catalogue_part_bytes)
+
 
 def _partition_extraction_guides(guides, genome, manifest):
     """Bound cumulative raw bucket work, reusing cache checks within this event."""
