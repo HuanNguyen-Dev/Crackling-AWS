@@ -180,46 +180,59 @@ def _split_results(combined_path, guides, directory, id_bits):
             'cfdPath': os.path.join(directory, f'{guide["targetId"]}-cfd.bin'),
         }
 
-    with ExitStack() as stack:
-        combined = stack.enter_context(open(combined_path, 'rb'))
-        outputs = {
-            target_id: {
-                'mit': stack.enter_context(open(result['mitPath'], 'wb')),
-                'cfd': stack.enter_context(open(result['cfdPath'], 'wb')),
-            }
-            for target_id, result in results.items()
-        }
+    with open(combined_path, 'rb') as combined:
+        active_signature = None
+        outputs = ExitStack()
+        mit_output = cfd_output = None
         mapper_result = MAPPER_RESULTS[id_bits]
         score_result = SCORE_RESULTS[id_bits]
         missing_id = (1 << id_bits) - 1
-        while True:
-            record = combined.read(mapper_result.size)
-            if not record:
-                break
-            if len(record) != mapper_result.size:
-                raise ValueError('Mapper produced a truncated binary record')
-            query_signature, offtarget_id, mit_score, cfd_score = (
-                mapper_result.unpack(record)
-            )
-            if query_signature not in signatures:
-                raise ValueError(
-                    f'Mapper returned unknown query signature {query_signature}'
+        try:
+            while True:
+                record = combined.read(mapper_result.size)
+                if not record:
+                    break
+                if len(record) != mapper_result.size:
+                    raise ValueError('Mapper produced a truncated binary record')
+                query_signature, offtarget_id, mit_score, cfd_score = (
+                    mapper_result.unpack(record)
                 )
-            for target_id in signatures[query_signature]:
-                result = results[target_id]
-                result['mapperRecords'] += 1
+                if query_signature not in signatures:
+                    raise ValueError(
+                        f'Mapper returned unknown query signature {query_signature}'
+                    )
+                if query_signature != active_signature:
+                    outputs.close()
+                    outputs = ExitStack()
+                    primary = results[signatures[query_signature][0]]
+                    mit_output = outputs.enter_context(open(primary['mitPath'], 'ab'))
+                    cfd_output = outputs.enter_context(open(primary['cfdPath'], 'ab'))
+                    active_signature = query_signature
+                for target_id in signatures[query_signature]:
+                    results[target_id]['mapperRecords'] += 1
                 if offtarget_id == missing_id:
                     continue
                 if mit_score != 0.0:
-                    outputs[target_id]['mit'].write(
-                        score_result.pack(offtarget_id, mit_score)
-                    )
-                    result['mitRecords'] += 1
+                    mit_output.write(score_result.pack(offtarget_id, mit_score))
+                    for target_id in signatures[query_signature]:
+                        results[target_id]['mitRecords'] += 1
                 if cfd_score != 0.0:
-                    outputs[target_id]['cfd'].write(
-                        score_result.pack(offtarget_id, cfd_score)
-                    )
-                    result['cfdRecords'] += 1
+                    cfd_output.write(score_result.pack(offtarget_id, cfd_score))
+                    for target_id in signatures[query_signature]:
+                        results[target_id]['cfdRecords'] += 1
+        finally:
+            outputs.close()
+
+    for target_ids in signatures.values():
+        primary = results[target_ids[0]]
+        for path in (primary['mitPath'], primary['cfdPath']):
+            if not os.path.exists(path):
+                with open(path, 'wb'):
+                    pass
+        for target_id in target_ids[1:]:
+            result = results[target_id]
+            shutil.copyfile(primary['mitPath'], result['mitPath'])
+            shutil.copyfile(primary['cfdPath'], result['cfdPath'])
     return results
 
 
