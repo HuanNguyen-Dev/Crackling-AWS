@@ -688,6 +688,7 @@ class CracklingStack(Stack):
             "mapLdaIsslSqsReducer",
             event_source_arn=sqsIsslReducer.queue_arn,
             batch_size=10,
+            max_concurrency=45,
             report_batch_item_failures=True
         )
         ddbTargets.grant_read_write_data(lambdaIsslReducer)
