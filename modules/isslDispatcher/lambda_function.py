@@ -472,6 +472,7 @@ def _dispatch_group(guides, genome, manifest, selected=None, allocation=None):
         end_id = (part_id + 1) * count // extractor_count
         tasks.append({
             'schemaVersion': 3,
+            'jobId': job_id,
             'batchId': batch_id,
             'batchKey': batch_key,
             'partId': part_id,

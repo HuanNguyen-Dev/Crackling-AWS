@@ -127,6 +127,16 @@ def _read_merged_range(source, start, end):
     return data
 
 def _process(task):
+    # Older queued tasks also identify the job in their extraction object key.
+    job_id = task.get('jobId') or (
+        task.get('batchKey', '').partition('/issl/extractions/')[2].split('/', 1)[0]
+    ) or None
+    print(json.dumps({
+        'event': 'extractor_start',
+        'jobId': job_id,
+        'batchId': task.get('batchId'),
+        'partId': task.get('partId'),
+    }))
     if task.get('schemaVersion') != 3:
         raise ValueError('Unsupported Extractor task schemaVersion')
     id_bits = int(task['idBits'])
@@ -212,6 +222,7 @@ def _process(task):
 
             print(json.dumps({
                 'event': 'extractor_bucket_sizes',
+                'jobId': job_id,
                 'batchId': task['batchId'],
                 'partId': task['partId'],
                 'sliceId': bucket['sliceId'],
@@ -232,6 +243,7 @@ def _process(task):
                             'recordCount': count, 'recordBytes': record_bytes, 'idBits': id_bits})
         print(json.dumps({
             'event': 'extractor_part_sizes',
+            'jobId': job_id,
             'batchId': task['batchId'],
             'partId': task['partId'],
             'expectedParts': task['expectedParts'],
@@ -249,6 +261,12 @@ def _process(task):
     sqs.send_message(QueueUrl=COMPLETION_QUEUE,
                      MessageBody=json.dumps({'batchKey': task['batchKey'],
                                              'completionPrefix': task['completionPrefix']}))
+    print(json.dumps({
+        'event': 'extractor_complete',
+        'jobId': job_id,
+        'batchId': task['batchId'],
+        'partId': task['partId'],
+    }))
 
 
 def lambda_handler(event, context):
