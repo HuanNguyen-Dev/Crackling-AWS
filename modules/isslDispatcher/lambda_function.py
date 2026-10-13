@@ -11,6 +11,7 @@ EXTRACTOR_QUEUE = os.environ['EXTRACTOR_QUEUE']
 MAX_EXTRACTORS = int(os.getenv('MAX_EXTRACTORS', '50'))
 EXTRACTOR_SAFE_BYTES = int(os.getenv('EXTRACTOR_SAFE_BYTES', str(8 * 1024 ** 3)))
 MAPPER_SAFE_BYTES = int(os.getenv('MAPPER_SAFE_BYTES', str(8 * 1024 ** 3)))
+MAX_MAPPER_GUIDES = int(os.getenv('MAX_GUIDES_PER_MAPPER', '100'))
 MAX_EXTRACTION_GUIDES = int(os.getenv('MAX_GUIDES_PER_EXTRACTION_GROUP', '100'))
 MAX_DISTANCE = int(os.getenv('MAX_DISTANCE', '4'))
 SCORE_THRESHOLD = float(os.getenv('SCORE_THRESHOLD', '75'))
@@ -18,7 +19,8 @@ SCORE_METHOD = os.getenv('SCORE_METHOD', 'and')
 s3 = boto3.client('s3')
 sqs = boto3.client('sqs')
 
-if min(MAX_EXTRACTORS, EXTRACTOR_SAFE_BYTES, MAPPER_SAFE_BYTES, MAX_EXTRACTION_GUIDES) < 1:
+if min(MAX_EXTRACTORS, EXTRACTOR_SAFE_BYTES, MAPPER_SAFE_BYTES,
+       MAX_EXTRACTION_GUIDES, MAX_MAPPER_GUIDES) < 1:
     raise ValueError('Extractor limits and maximum guide batch size must be positive')
 
 
@@ -233,7 +235,7 @@ def _mapper_tasks(guides, genome, manifest, selected):
     return tasks
 
 def _partition_guides(guides, manifest):
-    """Greedily bound metadata plus distinct hydrated buckets in every mapper."""
+    """Bound guide count and distinct hydrated bucket bytes per shard."""
     guides = sorted(guides, key=lambda item: int(item['TargetID']))
     record_bytes = int(manifest['layout']['hydratedRecordBytes'])
     shards = manifest['shards']
@@ -254,11 +256,15 @@ def _partition_guides(guides, manifest):
                 f'Guide {guide["TargetID"]} exceeds Mapper safe input limit '
                 f'{MAPPER_SAFE_BYTES} bytes'
             )
-        if group and any(
-            size + (0 if bucket_id in seen else added) > MAPPER_SAFE_BYTES
-            for size, bucket_id, seen, added
-            in zip(sizes, selected, bucket_ids, hydrated_bytes)
-        ):
+        added_bytes = [
+            0 if bucket_id in seen else size
+            for bucket_id, seen, size in zip(selected, bucket_ids, hydrated_bytes)
+        ]
+        exceeds_bytes = any(
+            size + added > MAPPER_SAFE_BYTES
+            for size, added in zip(sizes, added_bytes)
+        )
+        if group and (len(group) >= MAX_MAPPER_GUIDES or exceeds_bytes):
             groups.append(group)
             group = []
             bucket_ids = [set() for _ in shards]
