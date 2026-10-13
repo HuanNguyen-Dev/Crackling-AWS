@@ -676,7 +676,7 @@ class CracklingStack(Stack):
             vpc_subnets=ec2_.SubnetSelection(subnet_type=ec2_.SubnetType.PRIVATE_ISOLATED),
             timeout=duration,
             memory_size=4096,
-            reserved_concurrent_executions=60,
+            reserved_concurrent_executions=50,
             ephemeral_storage_size=cdk.Size.gibibytes(10),
             environment={
                 'TARGETS_TABLE': ddbTargets.table_name,
@@ -689,7 +689,7 @@ class CracklingStack(Stack):
             "mapLdaIsslSqsReducer",
             event_source_arn=sqsIsslReducer.queue_arn,
             batch_size=10,
-            max_concurrency=55,
+            max_concurrency=45,
             report_batch_item_failures=True
         )
         ddbTargets.grant_read_write_data(lambdaIsslReducer)
