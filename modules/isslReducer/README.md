@@ -1,60 +1,56 @@
-# ISSL Reducer Lambda
+# ISSL batch result finalizer
 
-The Reducer completes Stage 3 of the distributed off-target scoring path. S3
-invokes it whenever an object ending in `mapper-result.json` is created. Only Mapper
-completion keys matching the expected job, target, and shard structure are
-processed; Reducer completion events and unrelated objects are ignored.
-
-## Completion gate
-
-For each candidate guide, the Reducer checks for all five Mapper markers:
+The Reducer persists final MIT/CFD scores calculated by the combined Mapper.
+It consumes an S3 notification, directly or through the existing SQS envelope,
+for this schema-7 batch result:
 
 ```text
-<genome>/mapper/<job-id>/targets/<target-id>/shards/0/mapper-result.json
-...
-<genome>/mapper/<job-id>/targets/<target-id>/shards/4/mapper-result.json
+<genome>/mapper/<job-id>/batches/<batch-id>/mapper-result.json
 ```
 
-An invocation exits successfully when any marker is still absent. S3 invokes
-the function again as later markers arrive, so the event associated with the
-last completed shard can begin reduction. Duplicate and out-of-order events
-are safe.
+Old per-guide/shard paths and unrelated objects are ignored. A result on the
+batch path with an incompatible schema fails rather than mixing scoring formats.
+The Extractor and Extraction Completion interfaces are unchanged.
 
-## Reduction
+## Validation and persistence
 
-Each Mapper produces separate MIT and CFD streams of packed little-endian
-`(uint32 targetId, float64 contribution)` records. The Reducer streams all ten
-objects into a temporary SQLite database keyed by off-target ID. This keeps
-Lambda memory bounded and removes targets found through more than one ISSL
-slice. Duplicate contributions must agree; conflicting values fail visibly.
+The complete result must have matching job, batch and genome identities,
+`status: "complete"`, valid scoring settings and a nonempty score list with
+unique nonnegative Target IDs. Enabled scores must be finite within 0..100;
+disabled MIT/CFD scores must be `-1`. `scoreSemantics` is `complete` at threshold
+zero and `thresholded` at a positive threshold. Every row is validated before
+any target is written. Thresholded values can be early-stop scores.
 
-Final scores match the local C++ Reducer:
+For each guide, the existing two-item DynamoDB transaction atomically:
+
+- stores `IsslScore`, `CfdScore` and `ReducerTaskId` on the existing target;
+- increments `TaskTracking.NumScoredOfftarget` and `Version` once.
+
+The completion identity remains `<job-id>:<target-id>`. Conditional guards
+require an existing target without `ReducerTaskId` and an existing tracking
+item. Transaction conflicts use bounded exponential backoff with jitter.
+On a conditional failure, a consistent target read recognizes an identical
+completed score pair; a conflicting identity or score remains an error.
+
+The Reducer performs no candidate downloads, off-target deduplication,
+contribution summation or SQLite reduction. CDK configures 4,096 MB memory
+and default ephemeral storage for this finalizer.
+
+## Completion and retries
+
+After every target has been persisted or recognized as already complete,
+the Reducer writes one final marker:
 
 ```text
-score = 10000 / (100 + sum of unique contributions)
+<genome>/reducer/<job-id>/batches/<batch-id>/result.json
 ```
 
-## Outputs
+It includes schema/status, job/batch/genome identities, `sourceMapperKey`,
+`guideCount`, scoring settings, score semantics and `sourceDigest`, the SHA256
+of the canonical Mapper result JSON. A matching final marker skips further
+DynamoDB work; changed source content or a conflicting marker fails.
 
-The Reducer writes:
-
-```text
-<genome>/reducer/<job-id>/targets/<target-id>/mit.json
-<genome>/reducer/<job-id>/targets/<target-id>/cfd.json
-<genome>/reducer/<job-id>/targets/<target-id>/result.json
-```
-
-The MIT and CFD documents contain the final score, contribution sum, unique
-off-target count, source-record count, and duplicate count. `result.json` is an
-internal completion manifest referencing both score documents; it is not a
-user-facing list of off-target IDs.
-
-Before writing the final marker, one DynamoDB transaction:
-
-- stores the MIT score in the existing target `IsslScore` field;
-- stores CFD in `CfdScore` for later API integration;
-- records a deterministic `ReducerTaskId`; and
-- increments `NumScoredOfftarget` and the task-tracking version once.
-
-This preserves the existing job-completion and results pipeline. Retries that
-find the same `ReducerTaskId` do not increment the counter again.
+A failure during target persistence or final-marker upload leaves the batch
+retryable. Completed targets are skipped on retry without advancing counters
+again. SQS delivery returns `batchItemFailures` for failed messages while
+allowing other messages to succeed; direct S3 failures propagate.

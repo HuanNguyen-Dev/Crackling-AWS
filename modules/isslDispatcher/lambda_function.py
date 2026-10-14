@@ -191,57 +191,77 @@ def _send(queue, tasks):
 def _mapper_tasks(guides, genome, manifest, selected):
     guides = sorted(guides, key=lambda item: int(item['TargetID']))
     job_id = str(guides[0]['JobID'])
-    tasks = []
     shards = manifest['shards']
-    for shard in manifest['shards']:
+    selected_by_key = {
+        (int(item['sliceId']), int(item['bucketId'])): item
+        for item in selected
+    }
+    buckets = []
+    bucket_indexes = {}
+    # Slice order controls scoring traversal, even for nonconsecutive slice IDs.
+    for shard in shards:
         slice_id = int(shard['sliceId'])
-        required_buckets = {
+        required_buckets = sorted({
             _masked_bucket(guide['Sequence'], shard['mask'])
             for guide in guides
-        }
-        bucket_refs = [
-            {'bucketId': item['bucketId'], 'manifestKey': item['manifestKey']}
-            for item in selected if item['sliceId'] == slice_id
-            and item['bucketId'] in required_buckets
-        ]
-        contracts = []
-        for guide in guides:
-            target_id = int(guide['TargetID'])
-            bucket_id = _masked_bucket(guide['Sequence'], shard['mask'])
-            prefix = f'{genome}/mapper/{job_id}/targets/{target_id}/shards/{slice_id}'
-            contracts.append({
-                'taskId': _hash(job_id, target_id, slice_id),
-                'targetId': target_id, 'guideSequence': guide['Sequence'],
-                'bucketId': bucket_id,
-                'output': {'mitKey': f'{prefix}/mit.bin', 'cfdKey': f'{prefix}/cfd.bin',
-                           'metadataKey': f'{prefix}/mapper-result.json'},
-            })
-        tasks.append({
-            'schemaVersion': 6,
-            'batchId': _hash(job_id, *(g['TargetID'] for g in guides), slice_id),
-            'jobId': job_id, 'genome': genome, 'guides': contracts,
-            'shardId': int(shard['shardId']), 'shardCount': len(shards),
-            'sliceId': slice_id, 'buckets': bucket_refs,
-            'sliceIds': [int(item['sliceId']) for item in shards],
-            'idBits': int(manifest['layout']['idBits']),
-            'hydratedRecordBytes': int(manifest['layout']['hydratedRecordBytes']),
-            'scoring': {
-                'maxDistance': MAX_DISTANCE,
-                'scoreThreshold': SCORE_THRESHOLD,
-                'scoreMethod': SCORE_METHOD,
-            },
-            'output': {'bucket': BUCKET},
         })
-    return tasks
+        for bucket_id in required_buckets:
+            key = (slice_id, bucket_id)
+            bucket_indexes[key] = len(buckets)
+            buckets.append({
+                'sliceId': slice_id, 'bucketId': bucket_id,
+                'manifestKey': selected_by_key[key]['manifestKey'],
+            })
+    contracts = []
+    for guide in guides:
+        contracts.append({
+            'targetId': int(guide['TargetID']),
+            'guideSequence': guide['Sequence'][:20].upper(),
+            'bucketIndexes': [
+                bucket_indexes[(int(shard['sliceId']),
+                                _masked_bucket(guide['Sequence'], shard['mask']))]
+                for shard in shards
+            ],
+        })
+    task = {
+        'schemaVersion': 7, 'taskType': 'mapperBatch',
+        'jobId': job_id, 'genome': genome,
+        'guides': contracts, 'buckets': buckets,
+        'idBits': int(manifest['layout']['idBits']),
+        'hydratedRecordBytes': int(manifest['layout']['hydratedRecordBytes']),
+        'plannedHydratedBytes': sum(
+            int(shard['bucketEntryCounts'][bucket['bucketId']])
+            * int(manifest['layout']['hydratedRecordBytes'])
+            for shard in shards
+            for bucket in buckets
+            if int(shard['sliceId']) == bucket['sliceId']
+        ),
+        'scoring': {
+            'maxDistance': MAX_DISTANCE,
+            'scoreThreshold': SCORE_THRESHOLD,
+            'scoreMethod': SCORE_METHOD,
+        },
+        'output': {'bucket': BUCKET},
+    }
+    # Hash the complete immutable scoring input, not only guide IDs. Changing
+    # sequence, selection, width or scoring configuration must not reuse output.
+    batch_id = hashlib.sha256(json.dumps(
+        task, sort_keys=True, separators=(',', ':'), allow_nan=False,
+    ).encode()).hexdigest()
+    task['batchId'] = batch_id
+    task['output']['metadataKey'] = (
+        f'{genome}/mapper/{job_id}/batches/{batch_id}/mapper-result.json'
+    )
+    return [task]
 
 def _partition_guides(guides, manifest):
-    """Bound guide count and distinct hydrated bucket bytes per shard."""
+    """Bound guide count and distinct hydrated bytes across all selected slices."""
     guides = sorted(guides, key=lambda item: int(item['TargetID']))
     record_bytes = int(manifest['layout']['hydratedRecordBytes'])
     shards = manifest['shards']
     groups, group = [], []
-    bucket_ids = [set() for _ in shards]
-    sizes = [0 for _ in shards]
+    bucket_ids = set()
+    size = 0
     for guide in guides:
         selected = [
             _masked_bucket(guide['Sequence'], shard['mask'])
@@ -251,30 +271,31 @@ def _partition_guides(guides, manifest):
             int(shard['bucketEntryCounts'][bucket_id]) * record_bytes
             for shard, bucket_id in zip(shards, selected)
         ]
-        if any(size > MAPPER_SAFE_BYTES for size in hydrated_bytes):
+        if sum(hydrated_bytes) > MAPPER_SAFE_BYTES:
             raise ValueError(
                 f'Guide {guide["TargetID"]} exceeds Mapper safe input limit '
                 f'{MAPPER_SAFE_BYTES} bytes'
             )
-        added_bytes = [
-            0 if bucket_id in seen else size
-            for bucket_id, seen, size in zip(selected, bucket_ids, hydrated_bytes)
+        keys = [
+            (int(shard['sliceId']), bucket_id)
+            for shard, bucket_id in zip(shards, selected)
         ]
-        exceeds_bytes = any(
-            size + added > MAPPER_SAFE_BYTES
-            for size, added in zip(sizes, added_bytes)
+        added_bytes = sum(
+            count for key, count in zip(keys, hydrated_bytes)
+            if key not in bucket_ids
         )
-        if group and (len(group) >= MAX_MAPPER_GUIDES or exceeds_bytes):
+        if group and (len(group) >= MAX_MAPPER_GUIDES
+                      or size + added_bytes > MAPPER_SAFE_BYTES):
             groups.append(group)
             group = []
-            bucket_ids = [set() for _ in shards]
-            sizes = [0 for _ in shards]
+            bucket_ids = set()
+            size = 0
 
         group.append(guide)
-        for index, bucket_id in enumerate(selected):
-            if bucket_id not in bucket_ids[index]:
-                sizes[index] += hydrated_bytes[index]
-                bucket_ids[index].add(bucket_id)
+        for key, count in zip(keys, hydrated_bytes):
+            if key not in bucket_ids:
+                size += count
+                bucket_ids.add(key)
     if group:
         groups.append(group)
     return groups
@@ -426,6 +447,7 @@ def _dispatch_group(guides, genome, manifest, selected=None, allocation=None):
         job_id,
         *(int(g['TargetID']) for g in guides),
         f'extractors={extractor_count}',
+        *(task['batchId'] for task in mapper_tasks),
     )
     prefix = f'{genome}/issl/extractions/{job_id}/{batch_id}'
     batch_key = f'{prefix}/batch.json'

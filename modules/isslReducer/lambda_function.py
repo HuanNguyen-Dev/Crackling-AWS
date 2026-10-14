@@ -1,11 +1,11 @@
+"""Persist schema-7 Mapper batch scores; scoring and deduplication stay in Mapper."""
+
+import hashlib
 import json
 import math
 import os
 import random
 import re
-import sqlite3
-import struct
-import tempfile
 import time
 from urllib.parse import unquote_plus
 
@@ -18,10 +18,9 @@ TRANSACTION_BACKOFF_BASE_SECONDS = 0.05
 TRANSACTION_BACKOFF_MAX_SECONDS = 1.0
 TARGETS_TABLE = os.getenv('TARGETS_TABLE')
 TASK_TRACKING_TABLE = os.getenv('TASK_TRACKING_TABLE')
-SCORE_RECORDS = {32: struct.Struct('<Id'), 64: struct.Struct('<Qd')}
 MAPPER_MARKER_PATTERN = re.compile(
-    r'^(?P<genome>.+)/mapper/(?P<job_id>[^/]+)/targets/'
-    r'(?P<target_id>\d+)/shards/(?P<shard_id>\d+)/mapper-result\.json$'
+    r'^(?P<genome>.+)/mapper/(?P<job_id>[^/]+)/batches/'
+    r'(?P<batch_id>[^/]+)/mapper-result\.json$'
 )
 
 s3_client = boto3.client('s3')
@@ -29,19 +28,18 @@ dynamodb_client = boto3.client('dynamodb')
 
 
 def _mapper_event(record):
-    bucket = record['s3']['bucket']['name']
     key = unquote_plus(record['s3']['object']['key'])
     match = MAPPER_MARKER_PATTERN.fullmatch(key)
     if not match:
+        # Old per-guide/shard notifications must not enter batch finalization.
         return None
     values = match.groupdict()
     return {
-        'bucket': bucket,
+        'bucket': record['s3']['bucket']['name'],
         'key': key,
         'genome': values['genome'],
         'jobId': values['job_id'],
-        'targetId': int(values['target_id']),
-        'shardId': int(values['shard_id']),
+        'batchId': values['batch_id'],
     }
 
 
@@ -66,217 +64,97 @@ def _get_json(bucket, key, missing_is_none=False):
     return json.loads(response['Body'].read())
 
 
-def _marker_key(trigger, shard_id):
-    return (
-        f'{trigger["genome"]}/mapper/{trigger["jobId"]}/targets/'
-        f'{trigger["targetId"]}/shards/{shard_id}/mapper-result.json'
-    )
+def _finite_number(value):
+    return type(value) in (int, float) and math.isfinite(value)
 
 
-def _marker_contract(trigger):
-    marker = _get_json(trigger['bucket'], trigger['key'])
-    try:
-        slice_ids = [int(value) for value in marker['sliceIds']]
-        id_bits = int(marker['idBits'])
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError('Mapper marker has invalid slice or ID-width metadata') from error
-    if (id_bits not in SCORE_RECORDS or not slice_ids
-            or len(set(slice_ids)) != len(slice_ids)
-            or trigger['shardId'] not in slice_ids
-            or int(marker.get('shardCount', -1)) != len(slice_ids)):
-        raise ValueError('Mapper marker has invalid slice set')
-    return slice_ids, id_bits
-
-
-def _load_all_markers(trigger):
-    slice_ids, id_bits = _marker_contract(trigger)
-    markers = []
-    for shard_id in slice_ids:
-        marker = _get_json(
-            trigger['bucket'],
-            _marker_key(trigger, shard_id),
-            missing_is_none=True,
-        )
-        if marker is None:
-            return None
-        expected = {
-            'jobId': trigger['jobId'],
-            'targetId': trigger['targetId'],
-            'genome': trigger['genome'],
-            'shardId': shard_id,
-            'shardCount': len(slice_ids),
-            'sliceIds': slice_ids,
-            'idBits': id_bits,
-        }
-        for field, value in expected.items():
-            if marker.get(field) != value:
-                raise ValueError(
-                    f'Mapper marker {shard_id} has invalid {field}: '
-                    f'{marker.get(field)!r}'
-                )
-        markers.append(marker)
-    return markers, slice_ids, id_bits
-
-
-def _create_score_table(connection, score_name):
-    connection.execute(
-        f'CREATE TABLE {score_name} ('
-        'target_id BLOB PRIMARY KEY, score REAL NOT NULL)'
-    )
-
-
-def _read_score_records(bucket, key, id_bits):
-    score_record = SCORE_RECORDS[id_bits]
-    response = s3_client.get_object(Bucket=bucket, Key=key)
-    body = response['Body']
-    remainder = b''
-    while True:
-        chunk = body.read(8 * 1024 * 1024)
-        if not chunk:
-            break
-        data = remainder + chunk
-        complete_bytes = len(data) - (len(data) % score_record.size)
-        for offset in range(0, complete_bytes, score_record.size):
-            yield score_record.unpack_from(data, offset)
-        remainder = data[complete_bytes:]
-    if remainder:
-        raise ValueError(f'Score object {key} contains a truncated record')
-
-
-def _sqlite_global_id(global_id, id_bits):
-    """Make an unsigned ID a stable SQLite primary key at either width."""
-    try:
-        return sqlite3.Binary(struct.pack('<I' if id_bits == 32 else '<Q', global_id))
-    except struct.error as error:
-        raise ValueError('Score record has an invalid global ID') from error
-
-
-def _merge_score_object(connection, score_name, bucket, key, id_bits):
-    unique_count = 0
-    duplicate_count = 0
-    for target_id, score in _read_score_records(bucket, key, id_bits):
-        database_id = _sqlite_global_id(target_id, id_bits)
-        cursor = connection.execute(
-            f'INSERT OR IGNORE INTO {score_name} (target_id, score) '
-            'VALUES (?, ?)',
-            (database_id, score),
-        )
-        if cursor.rowcount == 1:
-            unique_count += 1
-            continue
-
-        duplicate_count += 1
-        existing = connection.execute(
-            f'SELECT score FROM {score_name} WHERE target_id = ?',
-            (database_id,),
-        ).fetchone()[0]
-        if not math.isclose(existing, score, rel_tol=1e-12, abs_tol=1e-12):
-            raise ValueError(
-                f'Conflicting {score_name.upper()} contribution for '
-                f'off-target {target_id}: {existing} != {score}'
-            )
-    connection.commit()
-    return unique_count, duplicate_count
-
-
-def _reduce_markers(bucket, markers, id_bits, database_path):
-    connection = sqlite3.connect(database_path)
-    try:
-        _create_score_table(connection, 'mit')
-        _create_score_table(connection, 'cfd')
-        source_records = {'mit': 0, 'cfd': 0}
-        duplicate_records = {'mit': 0, 'cfd': 0}
-
-        for marker in markers:
-            for score_name in ('mit', 'cfd'):
-                added, duplicates = _merge_score_object(
-                    connection,
-                    score_name,
-                    bucket,
-                    marker['outputs'][score_name],
-                    id_bits,
-                )
-                source_records[score_name] += added + duplicates
-                duplicate_records[score_name] += duplicates
-
-        reduced = {}
-        for score_name in ('mit', 'cfd'):
-            contribution_sum, unique_count = connection.execute(
-                f'SELECT COALESCE(SUM(score), 0.0), COUNT(*) FROM {score_name}'
-            ).fetchone()
-            reduced[score_name] = {
-                'score': 10000.0 / (100.0 + contribution_sum),
-                'contributionSum': contribution_sum,
-                'uniqueOfftargets': unique_count,
-                'sourceRecords': source_records[score_name],
-                'duplicateRecords': duplicate_records[score_name],
-            }
-        return reduced
-    finally:
-        connection.close()
-
-
-def _result_keys(trigger):
-    prefix = (
-        f'{trigger["genome"]}/reducer/{trigger["jobId"]}/targets/'
-        f'{trigger["targetId"]}'
-    )
-    return {
-        'mit': f'{prefix}/mit.json',
-        'cfd': f'{prefix}/cfd.json',
-        'result': f'{prefix}/result.json',
+def _validate_batch(trigger, marker):
+    """Validate every row before any persistence, including disabled methods."""
+    if not isinstance(marker, dict):
+        raise ValueError('Mapper batch marker must be an object')
+    expected = {
+        'schemaVersion': 7,
+        'status': 'complete',
+        'jobId': trigger['jobId'],
+        'batchId': trigger['batchId'],
+        'genome': trigger['genome'],
     }
+    for field, value in expected.items():
+        if marker.get(field) != value:
+            raise ValueError(f'Mapper batch marker has invalid {field}')
+    if type(marker['schemaVersion']) is not int:
+        raise ValueError('Mapper schemaVersion must be integer 7')
+
+    scoring = marker.get('scoring')
+    if not isinstance(scoring, dict):
+        raise ValueError('Mapper batch marker requires scoring configuration')
+    distance = scoring.get('maxDistance')
+    threshold = scoring.get('scoreThreshold')
+    method = scoring.get('scoreMethod')
+    if type(distance) is not int or not 0 <= distance <= 4:
+        raise ValueError('Mapper maxDistance must be an integer from 0 to 4')
+    if not _finite_number(threshold) or not 0 <= threshold <= 100:
+        raise ValueError('Mapper scoreThreshold must be finite from 0 to 100')
+    if method not in ('mit', 'cfd', 'and', 'or', 'avg'):
+        raise ValueError('Mapper scoreMethod is invalid')
+    semantics = 'complete' if threshold == 0 else 'thresholded'
+    if marker.get('scoreSemantics') != semantics:
+        raise ValueError('Mapper scoreSemantics does not match its threshold')
+
+    rows = marker.get('scores')
+    if not isinstance(rows, list) or not rows:
+        raise ValueError('Mapper batch requires a nonempty score list')
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError('Mapper score row must be an object')
+        target_id = row.get('targetId')
+        if type(target_id) is not int or target_id < 0 or target_id in seen:
+            raise ValueError('Mapper Target IDs must be unique nonnegative integers')
+        seen.add(target_id)
+        for name in ('mit', 'cfd'):
+            score = row.get(name)
+            disabled = (method == 'mit' and name == 'cfd') or (
+                method == 'cfd' and name == 'mit'
+            )
+            if not _finite_number(score) or (
+                score != -1 if disabled else not 0 <= score <= 100
+            ):
+                raise ValueError(f'Mapper target {target_id} has invalid {name} score')
+    return marker
+
+
+def _result_key(trigger):
+    return (
+        f'{trigger["genome"]}/reducer/{trigger["jobId"]}/batches/'
+        f'{trigger["batchId"]}/result.json'
+    )
 
 
 def _write_json(bucket, key, document):
     s3_client.put_object(
         Bucket=bucket,
         Key=key,
-        Body=json.dumps(document, separators=(',', ':')).encode('utf-8'),
+        Body=json.dumps(document, separators=(',', ':'), allow_nan=False).encode('utf-8'),
         ContentType='application/json',
     )
 
 
-def _reduce(trigger, markers, slice_ids, id_bits):
-    with tempfile.TemporaryDirectory(dir='/tmp') as directory:
-        reduced = _reduce_markers(
-            trigger['bucket'],
-            markers,
-            id_bits,
-            os.path.join(directory, 'reducer.sqlite3'),
-        )
-
-    keys = _result_keys(trigger)
-    common = {
-        'schemaVersion': 1,
-        'jobId': trigger['jobId'],
-        'targetId': trigger['targetId'],
-        'genome': trigger['genome'],
-        'shardCount': len(slice_ids),
-        'sliceIds': slice_ids,
-        'idBits': id_bits,
-    }
-    for score_name in ('mit', 'cfd'):
-        _write_json(
-            trigger['bucket'],
-            keys[score_name],
-            {**common, 'scoreMethod': score_name, **reduced[score_name]},
-        )
-
-    result = {
-        **common,
-        'status': 'complete',
-        'scores': {
-            'mit': reduced['mit']['score'],
-            'cfd': reduced['cfd']['score'],
-        },
-        'outputs': {'mit': keys['mit'], 'cfd': keys['cfd']},
-    }
-    return result, keys
-
-
 def _completion_id(trigger):
     return f'{trigger["jobId"]}:{trigger["targetId"]}'
+
+
+def _matching_target(target, completion_id, scores):
+    if target.get('ReducerTaskId', {}).get('S') != completion_id:
+        return False
+    for attribute, name in (('IsslScore', 'mit'), ('CfdScore', 'cfd')):
+        try:
+            stored = json.loads(target[attribute]['S'])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError('Completed target has invalid persisted scores') from error
+        if not _finite_number(stored) or stored != scores[name]:
+            raise ValueError('Completed target scores conflict with Mapper batch')
+    return True
 
 
 def _record_pipeline_completion(trigger, scores):
@@ -287,52 +165,47 @@ def _record_pipeline_completion(trigger, scores):
     for attempt in range(TRANSACTION_MAX_ATTEMPTS):
         try:
             dynamodb_client.transact_write_items(
-            TransactItems=[
-                {
-                    'Update': {
-                        'TableName': TARGETS_TABLE,
-                        'Key': {
-                            'JobID': {'S': trigger['jobId']},
-                            'TargetID': {'N': str(trigger['targetId'])},
-                        },
-                        'UpdateExpression': (
-                            'SET IsslScore = :mit, CfdScore = :cfd, '
-                            'ReducerTaskId = :task'
-                        ),
-                        'ConditionExpression': (
-                            'attribute_exists(JobID) AND '
-                            'attribute_not_exists(ReducerTaskId)'
-                        ),
-                        'ExpressionAttributeValues': {
-                            ':mit': {'S': json.dumps(scores['mit'])},
-                            ':cfd': {'S': json.dumps(scores['cfd'])},
-                            ':task': {'S': completion_id},
-                        },
-                    },
-                },
-                {
-                    'Update': {
-                        'TableName': TASK_TRACKING_TABLE,
-                        'Key': {'JobID': {'S': trigger['jobId']}},
-                        'UpdateExpression': (
-                            'ADD NumScoredOfftarget :one, #version :one'
-                        ),
-                        'ConditionExpression': 'attribute_exists(JobID)',
-                        'ExpressionAttributeNames': {
-                            '#version': 'Version',
-                        },
-                        'ExpressionAttributeValues': {
-                            ':one': {'N': '1'},
+                TransactItems=[
+                    {
+                        'Update': {
+                            'TableName': TARGETS_TABLE,
+                            'Key': {
+                                'JobID': {'S': trigger['jobId']},
+                                'TargetID': {'N': str(trigger['targetId'])},
+                            },
+                            'UpdateExpression': (
+                                'SET IsslScore = :mit, CfdScore = :cfd, '
+                                'ReducerTaskId = :task'
+                            ),
+                            'ConditionExpression': (
+                                'attribute_exists(JobID) AND '
+                                'attribute_not_exists(ReducerTaskId)'
+                            ),
+                            'ExpressionAttributeValues': {
+                                ':mit': {'S': json.dumps(scores['mit'])},
+                                ':cfd': {'S': json.dumps(scores['cfd'])},
+                                ':task': {'S': completion_id},
+                            },
                         },
                     },
-                },
-            ],
+                    {
+                        'Update': {
+                            'TableName': TASK_TRACKING_TABLE,
+                            'Key': {'JobID': {'S': trigger['jobId']}},
+                            'UpdateExpression': (
+                                'ADD NumScoredOfftarget :one, #version :one'
+                            ),
+                            'ConditionExpression': 'attribute_exists(JobID)',
+                            'ExpressionAttributeNames': {'#version': 'Version'},
+                            'ExpressionAttributeValues': {':one': {'N': '1'}},
+                        },
+                    },
+                ],
             )
             return True
         except ClientError as error:
             if error.response.get('Error', {}).get('Code') != 'TransactionCanceledException':
                 raise
-
             cancellation_reasons = error.response.get('CancellationReasons', [])
             has_conflict = any(
                 reason.get('Code') == 'TransactionConflict'
@@ -356,7 +229,6 @@ def _record_pipeline_completion(trigger, scores):
                 }))
                 time.sleep(delay)
                 continue
-
             target = dynamodb_client.get_item(
                 TableName=TARGETS_TABLE,
                 Key={
@@ -365,8 +237,7 @@ def _record_pipeline_completion(trigger, scores):
                 },
                 ConsistentRead=True,
             ).get('Item', {})
-            recorded_id = target.get('ReducerTaskId', {}).get('S')
-            if recorded_id == completion_id:
+            if _matching_target(target, completion_id, scores):
                 return False
             raise
 
@@ -375,43 +246,55 @@ def _process_s3_record(record):
     trigger = _mapper_event(record)
     if trigger is None:
         return 'ignored'
-    loaded = _load_all_markers(trigger)
-    if loaded is None:
-        return 'waiting'
-    markers, slice_ids, id_bits = loaded
-    keys = _result_keys(trigger)
-    existing_result = _get_json(
-        trigger['bucket'], keys['result'], missing_is_none=True,
-    )
-    if existing_result is not None:
+    marker = _validate_batch(trigger, _get_json(trigger['bucket'], trigger['key']))
+    # Detect replacement/corruption of a deterministic Mapper result key.
+    source_digest = hashlib.sha256(json.dumps(
+        marker, sort_keys=True, separators=(',', ':'), allow_nan=False,
+    ).encode('utf-8')).hexdigest()
+    result = {
+        'schemaVersion': 7,
+        'status': 'complete',
+        'jobId': trigger['jobId'],
+        'batchId': trigger['batchId'],
+        'genome': trigger['genome'],
+        'sourceMapperKey': trigger['key'],
+        'sourceDigest': source_digest,
+        'guideCount': len(marker['scores']),
+        'scoring': marker['scoring'],
+        'scoreSemantics': marker['scoreSemantics'],
+    }
+    key = _result_key(trigger)
+    existing = _get_json(trigger['bucket'], key, missing_is_none=True)
+    if existing is not None:
+        if existing != result:
+            raise ValueError('Batch finalization marker conflicts with Mapper result')
         return 'processed'
 
-    result, keys = _reduce(trigger, markers, slice_ids, id_bits)
-    pipeline_updated = _record_pipeline_completion(
-        trigger, result['scores'],
-    )
-    result['pipelineStatus'] = 'complete'
-    # The final marker is written only after both score objects and the
-    # existing DynamoDB completion pipeline have succeeded.
-    _write_json(trigger['bucket'], keys['result'], result)
+    updated = 0
+    for row in marker['scores']:
+        updated += _record_pipeline_completion(
+            {**trigger, 'targetId': row['targetId']},
+            {'mit': row['mit'], 'cfd': row['cfd']},
+        )
+    # A partial DynamoDB failure leaves no marker; retry resumes via target guards.
+    _write_json(trigger['bucket'], key, result)
     print(json.dumps({
-        'event': 'reducer_complete',
+        'event': 'reducer_batch_complete',
         'jobId': trigger['jobId'],
-        'targetId': trigger['targetId'],
-        'scores': result['scores'],
-        'pipelineUpdated': pipeline_updated,
+        'batchId': trigger['batchId'],
+        'guideCount': len(marker['scores']),
+        'targetsUpdated': updated,
     }))
     return 'processed'
 
 
 def lambda_handler(event, context):
-    counts = {'processed': 0, 'waiting': 0, 'ignored': 0}
+    counts = {'processed': 0, 'ignored': 0}
     batch_item_failures = []
     for envelope in event.get('Records', []):
         try:
             for record in _s3_records(envelope):
-                outcome = _process_s3_record(record)
-                counts[outcome] += 1
+                counts[_process_s3_record(record)] += 1
         except Exception as error:
             message_id = envelope.get('messageId')
             if message_id is None:
@@ -423,6 +306,5 @@ def lambda_handler(event, context):
                 'error': str(error),
             }))
             batch_item_failures.append({'itemIdentifier': message_id})
-
     counts['batchItemFailures'] = batch_item_failures
     return counts

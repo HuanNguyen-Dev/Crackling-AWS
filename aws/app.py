@@ -640,8 +640,8 @@ class CracklingStack(Stack):
         )
         lambdaIsslCoordinator.add_to_role_policy(policyAccessS3GenomeBucket)
 
-        ### Score one candidate-guide batch against one Coordinator shard.
-        # Results remain separated per guide for Stage 3 reduction.
+        ### Score each guide batch against all of its selected index slices.
+        # One result marker contains the native final scores for the batch.
         lambdaIsslMapper = lambda_.Function(self, "lambdaIsslMapper",
             runtime=lambda_.Runtime.PYTHON_3_10,
             handler="lambda_function.lambda_handler",
@@ -654,7 +654,8 @@ class CracklingStack(Stack):
             ephemeral_storage_size=cdk.Size.gibibytes(10),
             environment={
                 'LD_LIBRARY_PATH': ld_library_path,
-                'OMP_NUM_THREADS': '6'
+                'MAPPER_SAFE_BYTES': str(8 * 1024 ** 3),
+                'MAPPER_DOWNLOAD_WORKERS': '4'
             }
         )
         sqsIsslMapper.grant_consume_messages(lambdaIsslMapper)
@@ -665,9 +666,8 @@ class CracklingStack(Stack):
         )
         lambdaIsslMapper.add_to_role_policy(policyAccessS3GenomeBucket)
 
-        ### Reduce a guide after all five Mapper completion markers exist.
-        # Mapper result events may arrive in any order; the Reducer invocation
-        # that observes all five markers performs the deterministic reduction.
+        ### Persist one Mapper batch's final scores with retry-safe progress.
+        # No per-offtarget streams or cross-slice SQLite reduction are required.
         lambdaIsslReducer = lambda_.Function(self, "lambdaIsslReducer",
             runtime=lambda_.Runtime.PYTHON_3_10,
             handler="lambda_function.lambda_handler",
@@ -677,7 +677,6 @@ class CracklingStack(Stack):
             timeout=duration,
             memory_size=4096,
             reserved_concurrent_executions=50,
-            ephemeral_storage_size=cdk.Size.gibibytes(10),
             environment={
                 'TARGETS_TABLE': ddbTargets.table_name,
                 'TASK_TRACKING_TABLE': ddbTaskTracking.table_name,
