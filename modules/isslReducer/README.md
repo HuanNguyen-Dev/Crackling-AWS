@@ -21,16 +21,31 @@ disabled MIT/CFD scores must be `-1`. `scoreSemantics` is `complete` at threshol
 zero and `thresholded` at a positive threshold. Every row is validated before
 any target is written. Thresholded values can be early-stop scores.
 
-For each guide, the existing two-item DynamoDB transaction atomically:
+For each new Mapper batch, one DynamoDB transaction atomically:
 
-- stores `IsslScore`, `CfdScore` and `ReducerTaskId` on the existing target;
-- increments `TaskTracking.NumScoredOfftarget` and `Version` once.
+- stores `IsslScore`, `CfdScore` and `ReducerTaskId` on every existing target;
+- increments `TaskTracking.NumScoredOfftarget` by the batch's guide count and increments `Version` once;
+- inserts a conditional completion record in `ddbIsslBatchCompletions`.
+
+New Mapper batches are configured at 95 guides: 95 target updates, one tracking
+update and one completion record use 97 of DynamoDB's 100 transaction actions.
+The Reducer enforces a hard maximum of 98 guides.
+Completion records are keyed by `JobID` and the Mapper `BatchID`, and contain
+the source digest and guide count. The durable
+record prevents double counting even if S3 publication fails or the transaction
+commits but its response is lost. All target conditions are checked before any
+new scores or progress are committed.
 
 The completion identity remains `<job-id>:<target-id>`. Conditional guards
 require an existing target without `ReducerTaskId` and an existing tracking
-item. Transaction conflicts use bounded exponential backoff with jitter.
-On a conditional failure, a consistent target read recognizes an identical
-completed score pair; a conflicting identity or score remains an error.
+item. Transaction conflicts use 16 attempts with exponential jitter starting
+at 0.1 seconds and capped at 2 seconds per sleep. Retries stop early if the
+Lambda context has insufficient remaining time.
+On transaction cancellation, a consistent completion-record read recognizes
+a duplicate committed batch. Other conditional failures remain errors. Results
+above 98 guides are rejected before writes; there is no recovery of old
+per-guide completions or splitting of old batches. A completed target without
+the matching batch guard causes the entire transaction to fail.
 
 The Reducer performs no candidate downloads, off-target deduplication,
 contribution summation or SQLite reduction. CDK configures 4,096 MB memory
@@ -38,8 +53,8 @@ and default ephemeral storage for this finalizer.
 
 ## Completion and retries
 
-After every target has been persisted or recognized as already complete,
-the Reducer writes one final marker:
+After the batch transaction commits or its durable completion record confirms
+an earlier commit, the Reducer writes one final marker:
 
 ```text
 <genome>/reducer/<job-id>/batches/<batch-id>/result.json
@@ -50,7 +65,12 @@ It includes schema/status, job/batch/genome identities, `sourceMapperKey`,
 of the canonical Mapper result JSON. A matching final marker skips further
 DynamoDB work; changed source content or a conflicting marker fails.
 
-A failure during target persistence or final-marker upload leaves the batch
-retryable. Completed targets are skipped on retry without advancing counters
-again. SQS delivery returns `batchItemFailures` for failed messages while
+A failed batch transaction writes no targets or progress. A failure after it
+commits leaves its durable completion record; retries skip the committed batch
+without advancing counters again. SQS delivery returns `batchItemFailures` for failed messages while
 allowing other messages to succeed; direct S3 failures propagate.
+
+Deployment must include the CDK changes that create the completion table, set
+`BATCH_COMPLETIONS_TABLE` and grant table access plus `TransactWriteItems` for
+all three tables. Deploy the Dispatcher cap and Reducer change together. The
+native Mapper interface is unchanged, so no binary rebuild is required.

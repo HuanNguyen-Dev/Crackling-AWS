@@ -13,11 +13,13 @@ import boto3
 from botocore.exceptions import ClientError
 
 
-TRANSACTION_MAX_ATTEMPTS = 5
-TRANSACTION_BACKOFF_BASE_SECONDS = 0.05
-TRANSACTION_BACKOFF_MAX_SECONDS = 1.0
+TRANSACTION_MAX_ATTEMPTS = 16
+TRANSACTION_BACKOFF_BASE_SECONDS = 0.1
+TRANSACTION_BACKOFF_MAX_SECONDS = 2.0
+MAX_ATOMIC_GUIDES = 98
 TARGETS_TABLE = os.getenv('TARGETS_TABLE')
 TASK_TRACKING_TABLE = os.getenv('TASK_TRACKING_TABLE')
+BATCH_COMPLETIONS_TABLE = os.getenv('BATCH_COMPLETIONS_TABLE')
 MAPPER_MARKER_PATTERN = re.compile(
     r'^(?P<genome>.+)/mapper/(?P<job_id>[^/]+)/batches/'
     r'(?P<batch_id>[^/]+)/mapper-result\.json$'
@@ -102,8 +104,8 @@ def _validate_batch(trigger, marker):
         raise ValueError('Mapper scoreSemantics does not match its threshold')
 
     rows = marker.get('scores')
-    if not isinstance(rows, list) or not rows:
-        raise ValueError('Mapper batch requires a nonempty score list')
+    if not isinstance(rows, list) or not 1 <= len(rows) <= MAX_ATOMIC_GUIDES:
+        raise ValueError('Mapper batch must contain between 1 and 98 guides')
     seen = set()
     for row in rows:
         if not isinstance(row, dict):
@@ -144,105 +146,104 @@ def _completion_id(trigger):
     return f'{trigger["jobId"]}:{trigger["targetId"]}'
 
 
-def _matching_target(target, completion_id, scores):
-    if target.get('ReducerTaskId', {}).get('S') != completion_id:
+def _batch_guard(trigger, source_digest, rows):
+    return {
+        'JobID': {'S': trigger['jobId']},
+        'BatchID': {'S': trigger['batchId']},
+        'SourceDigest': {'S': source_digest},
+        'Genome': {'S': trigger['genome']},
+        'GuideCount': {'N': str(len(rows))},
+    }
+
+
+def _guard_complete(guard):
+    existing = dynamodb_client.get_item(
+        TableName=BATCH_COMPLETIONS_TABLE,
+        Key={name: guard[name] for name in ('JobID', 'BatchID')},
+        ConsistentRead=True,
+    ).get('Item', {})
+    if not existing:
         return False
-    for attribute, name in (('IsslScore', 'mit'), ('CfdScore', 'cfd')):
-        try:
-            stored = json.loads(target[attribute]['S'])
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError('Completed target has invalid persisted scores') from error
-        if not _finite_number(stored) or stored != scores[name]:
-            raise ValueError('Completed target scores conflict with Mapper batch')
+    if any(existing.get(name) != value for name, value in guard.items()):
+        raise ValueError('Batch completion record conflicts with Mapper result')
     return True
 
 
-def _record_pipeline_completion(trigger, scores):
-    if not TARGETS_TABLE or not TASK_TRACKING_TABLE:
-        raise ValueError('Reducer DynamoDB table environment is not configured')
+def _completion_transaction(trigger, rows, guard):
+    actions = []
+    for row in rows:
+        actions.append({'Update': {
+            'TableName': TARGETS_TABLE,
+            'Key': {'JobID': {'S': trigger['jobId']},
+                    'TargetID': {'N': str(row['targetId'])}},
+            'UpdateExpression': 'SET IsslScore = :mit, CfdScore = :cfd, ReducerTaskId = :task',
+            'ConditionExpression': 'attribute_exists(JobID) AND attribute_not_exists(ReducerTaskId)',
+            'ExpressionAttributeValues': {
+                ':mit': {'S': json.dumps(row['mit'])},
+                ':cfd': {'S': json.dumps(row['cfd'])},
+                ':task': {'S': _completion_id({**trigger, 'targetId': row['targetId']})},
+            },
+        }})
+    actions.append({'Update': {
+        'TableName': TASK_TRACKING_TABLE,
+        'Key': {'JobID': {'S': trigger['jobId']}},
+        'UpdateExpression': 'ADD NumScoredOfftarget :count, #version :one',
+        'ConditionExpression': 'attribute_exists(JobID)',
+        'ExpressionAttributeNames': {'#version': 'Version'},
+        'ExpressionAttributeValues': {':count': {'N': str(len(rows))}, ':one': {'N': '1'}},
+    }})
+    actions.append({'Put': {
+        'TableName': BATCH_COMPLETIONS_TABLE,
+        'Item': guard,
+        'ConditionExpression': 'attribute_not_exists(JobID)',
+    }})
+    return actions
 
-    completion_id = _completion_id(trigger)
+
+def _record_batch_completion(trigger, rows, source_digest, context=None):
+    guard = _batch_guard(trigger, source_digest, rows)
+    if _guard_complete(guard):
+        return 0
+    actions = _completion_transaction(trigger, rows, guard)
     for attempt in range(TRANSACTION_MAX_ATTEMPTS):
         try:
             dynamodb_client.transact_write_items(
-                TransactItems=[
-                    {
-                        'Update': {
-                            'TableName': TARGETS_TABLE,
-                            'Key': {
-                                'JobID': {'S': trigger['jobId']},
-                                'TargetID': {'N': str(trigger['targetId'])},
-                            },
-                            'UpdateExpression': (
-                                'SET IsslScore = :mit, CfdScore = :cfd, '
-                                'ReducerTaskId = :task'
-                            ),
-                            'ConditionExpression': (
-                                'attribute_exists(JobID) AND '
-                                'attribute_not_exists(ReducerTaskId)'
-                            ),
-                            'ExpressionAttributeValues': {
-                                ':mit': {'S': json.dumps(scores['mit'])},
-                                ':cfd': {'S': json.dumps(scores['cfd'])},
-                                ':task': {'S': completion_id},
-                            },
-                        },
-                    },
-                    {
-                        'Update': {
-                            'TableName': TASK_TRACKING_TABLE,
-                            'Key': {'JobID': {'S': trigger['jobId']}},
-                            'UpdateExpression': (
-                                'ADD NumScoredOfftarget :one, #version :one'
-                            ),
-                            'ConditionExpression': 'attribute_exists(JobID)',
-                            'ExpressionAttributeNames': {'#version': 'Version'},
-                            'ExpressionAttributeValues': {':one': {'N': '1'}},
-                        },
-                    },
-                ],
+                TransactItems=actions,
             )
-            return True
+            return len(rows)
         except ClientError as error:
             if error.response.get('Error', {}).get('Code') != 'TransactionCanceledException':
                 raise
-            cancellation_reasons = error.response.get('CancellationReasons', [])
-            has_conflict = any(
-                reason.get('Code') == 'TransactionConflict'
-                for reason in cancellation_reasons
-            )
-            if has_conflict and attempt + 1 < TRANSACTION_MAX_ATTEMPTS:
-                delay = random.uniform(
-                    0,
-                    min(
-                        TRANSACTION_BACKOFF_MAX_SECONDS,
-                        TRANSACTION_BACKOFF_BASE_SECONDS * (2 ** attempt),
-                    ),
-                )
-                print(json.dumps({
-                    'event': 'reducer_transaction_conflict',
-                    'jobId': trigger['jobId'],
-                    'targetId': trigger['targetId'],
-                    'attempt': attempt + 1,
-                    'retryDelaySeconds': delay,
-                    'cancellationReasons': cancellation_reasons,
-                }))
-                time.sleep(delay)
-                continue
-            target = dynamodb_client.get_item(
-                TableName=TARGETS_TABLE,
-                Key={
-                    'JobID': {'S': trigger['jobId']},
-                    'TargetID': {'N': str(trigger['targetId'])},
-                },
-                ConsistentRead=True,
-            ).get('Item', {})
-            if _matching_target(target, completion_id, scores):
-                return False
-            raise
+            reasons = error.response.get('CancellationReasons', [])
+            # A durable guard protects retries after the DynamoDB commit but
+            # before S3 publication, including retries beyond ten minutes.
+            if _guard_complete(guard):
+                return 0
+            codes = {reason.get('Code') for reason in reasons}
+            # New batches are atomic. A completed target without this batch's
+            # guard is inconsistent input, not a partially recoverable batch.
+            if not codes or codes - {'None', 'TransactionConflict'}:
+                raise
+            if attempt + 1 == TRANSACTION_MAX_ATTEMPTS:
+                raise
+            delay = random.uniform(0, min(
+                TRANSACTION_BACKOFF_MAX_SECONDS,
+                TRANSACTION_BACKOFF_BASE_SECONDS * (2 ** attempt),
+            ))
+            if (context is not None and hasattr(context, 'get_remaining_time_in_millis')
+                    and context.get_remaining_time_in_millis() < (delay + 2) * 1000):
+                raise TimeoutError('Insufficient time remaining to retry batch completion')
+            print(json.dumps({
+                'event': 'reducer_transaction_conflict', 'jobId': trigger['jobId'],
+                'batchId': trigger['batchId'],
+                'attempt': attempt + 1, 'retryDelaySeconds': delay,
+                'cancellationReasons': reasons,
+            }))
+            time.sleep(delay)
 
 
-def _process_s3_record(record):
+
+def _process_s3_record(record, context=None):
     trigger = _mapper_event(record)
     if trigger is None:
         return 'ignored'
@@ -270,13 +271,10 @@ def _process_s3_record(record):
             raise ValueError('Batch finalization marker conflicts with Mapper result')
         return 'processed'
 
-    updated = 0
-    for row in marker['scores']:
-        updated += _record_pipeline_completion(
-            {**trigger, 'targetId': row['targetId']},
-            {'mit': row['mit'], 'cfd': row['cfd']},
-        )
-    # A partial DynamoDB failure leaves no marker; retry resumes via target guards.
+    if not TARGETS_TABLE or not TASK_TRACKING_TABLE or not BATCH_COMPLETIONS_TABLE:
+        raise ValueError('Reducer DynamoDB table environment is not configured')
+    updated = _record_batch_completion(trigger, marker['scores'], source_digest, context)
+    # Publish after the atomic commit; the durable guard protects S3 retries.
     _write_json(trigger['bucket'], key, result)
     print(json.dumps({
         'event': 'reducer_batch_complete',
@@ -294,7 +292,7 @@ def lambda_handler(event, context):
     for envelope in event.get('Records', []):
         try:
             for record in _s3_records(envelope):
-                counts[_process_s3_record(record)] += 1
+                counts[_process_s3_record(record, context)] += 1
         except Exception as error:
             message_id = envelope.get('messageId')
             if message_id is None:

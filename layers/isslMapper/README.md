@@ -4,8 +4,14 @@ This layer supplies the Linux x86_64 AVX2 scorer at `/opt/mapper`. Schema-7
 Mapper tasks combine the selected hydrated buckets from all index slices for
 one guide batch. The Dispatcher supplies each guide's bucket indexes, so the
 Mapper downloads each required bucket once and each guide scans only its own
-selected ranges. The initial batch cap is 100 guides, with a separate bound on
+selected ranges. The configured batch cap is 95 guides, with a separate bound on
 the total hydrated input bytes. The Extractor and cache format stay unchanged.
+
+The 95-guide cap uses 97 DynamoDB transaction actions: 95 guide updates, the
+shared job counter update and durable batch-completion record, leaving three
+actions spare. The Reducer's hard maximum remains 98 guides. It commits the
+guide scores, progress increment and completion record atomically. Native
+scoring and its CLI do not need a binary rebuild for this cap change.
 
 **Rebuild the binary before using the schema-7 wrapper.** The existing packaged
 binary implements an incompatible shard/contribution interface. No binary was

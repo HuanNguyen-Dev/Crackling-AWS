@@ -155,6 +155,14 @@ class CracklingStack(Stack):
             stream=ddb_.StreamViewType.NEW_AND_OLD_IMAGES
         )
 
+        ### Durable retry guards for atomic ISSL batch completion.
+        ddbIsslBatchCompletions = ddb_.Table(self, "ddbIsslBatchCompletions",
+            removal_policy=RemovalPolicy.DESTROY,
+            billing_mode=ddb_.BillingMode.PAY_PER_REQUEST,
+            partition_key=ddb_.Attribute(name="JobID", type=ddb_.AttributeType.STRING),
+            sort_key=ddb_.Attribute(name="BatchID", type=ddb_.AttributeType.STRING)
+        )
+
         ### DynamoDB table for storing targets.
         # The sort key enables quicker indexing.
         ddbTargets = ddb_.Table(self, "ddbTargets",
@@ -323,7 +331,7 @@ class CracklingStack(Stack):
         sqsIsslReducer = sqs_.Queue(self, "sqsIsslReducer",
             receive_message_wait_time=Duration.seconds(20),
             visibility_timeout=duration,
-            retention_period=Duration.minutes(60)
+            retention_period=Duration.minutes(30)
         )
         
         ### SQS queue for evaluating guide efficiency
@@ -547,7 +555,9 @@ class CracklingStack(Stack):
                 'MAX_EXTRACTORS': '50',
                 'EXTRACTOR_SAFE_BYTES': str(8 * 1024 ** 3),
                 'MAPPER_SAFE_BYTES': str(8 * 1024 ** 3),
-                'MAX_GUIDES_PER_MAPPER': '100',
+                # 95 guides + progress update + completion guard = 97 of 100
+                # DynamoDB transaction actions, leaving three actions spare.
+                'MAX_GUIDES_PER_MAPPER': '95',
                 'MAX_GUIDES_PER_EXTRACTION_GROUP': '1000',
                 'MAX_DISTANCE': '4',
                 'SCORE_THRESHOLD': '75',
@@ -680,6 +690,7 @@ class CracklingStack(Stack):
             environment={
                 'TARGETS_TABLE': ddbTargets.table_name,
                 'TASK_TRACKING_TABLE': ddbTaskTracking.table_name,
+                'BATCH_COMPLETIONS_TABLE': ddbIsslBatchCompletions.table_name,
             }
         )
         lambdaIsslReducer.add_to_role_policy(policyAccessS3GenomeBucket)
@@ -693,9 +704,11 @@ class CracklingStack(Stack):
         )
         ddbTargets.grant_read_write_data(lambdaIsslReducer)
         ddbTaskTracking.grant_read_write_data(lambdaIsslReducer)
+        ddbIsslBatchCompletions.grant_read_write_data(lambdaIsslReducer)
         lambdaIsslReducer.add_to_role_policy(iam_.PolicyStatement(
             actions=['dynamodb:TransactWriteItems'],
-            resources=[ddbTargets.table_arn, ddbTaskTracking.table_arn]
+            resources=[ddbTargets.table_arn, ddbTaskTracking.table_arn,
+                       ddbIsslBatchCompletions.table_arn]
         ))
         s3Genome.add_event_notification(
             s3_.EventType.OBJECT_CREATED,

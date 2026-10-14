@@ -11,7 +11,8 @@ EXTRACTOR_QUEUE = os.environ['EXTRACTOR_QUEUE']
 MAX_EXTRACTORS = int(os.getenv('MAX_EXTRACTORS', '50'))
 EXTRACTOR_SAFE_BYTES = int(os.getenv('EXTRACTOR_SAFE_BYTES', str(8 * 1024 ** 3)))
 MAPPER_SAFE_BYTES = int(os.getenv('MAPPER_SAFE_BYTES', str(8 * 1024 ** 3)))
-MAX_MAPPER_GUIDES = int(os.getenv('MAX_GUIDES_PER_MAPPER', '100'))
+# 95 target updates + progress update + completion guard use 97 of 100 actions.
+MAX_MAPPER_GUIDES = int(os.getenv('MAX_GUIDES_PER_MAPPER', '95'))
 MAX_EXTRACTION_GUIDES = int(os.getenv('MAX_GUIDES_PER_EXTRACTION_GROUP', '100'))
 MAX_DISTANCE = int(os.getenv('MAX_DISTANCE', '4'))
 SCORE_THRESHOLD = float(os.getenv('SCORE_THRESHOLD', '75'))
@@ -22,6 +23,9 @@ sqs = boto3.client('sqs')
 if min(MAX_EXTRACTORS, EXTRACTOR_SAFE_BYTES, MAPPER_SAFE_BYTES,
        MAX_EXTRACTION_GUIDES, MAX_MAPPER_GUIDES) < 1:
     raise ValueError('Extractor limits and maximum guide batch size must be positive')
+
+if MAX_MAPPER_GUIDES > 98:
+    raise ValueError('MAX_GUIDES_PER_MAPPER must not exceed 98 for atomic finalization')
 
 
 def _json(key):
