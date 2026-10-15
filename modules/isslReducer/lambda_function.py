@@ -212,17 +212,29 @@ def _record_batch_completion(trigger, rows, source_digest, context=None):
             )
             return len(rows)
         except ClientError as error:
-            if error.response.get('Error', {}).get('Code') != 'TransactionCanceledException':
-                raise
+            error_code = error.response.get('Error', {}).get('Code')
             reasons = error.response.get('CancellationReasons', [])
-            # A durable guard protects retries after the DynamoDB commit but
-            # before S3 publication, including retries beyond ten minutes.
-            if _guard_complete(guard):
-                return 0
             codes = {reason.get('Code') for reason in reasons}
-            # New batches are atomic. A completed target without this batch's
-            # guard is inconsistent input, not a partially recoverable batch.
-            if not codes or codes - {'None', 'TransactionConflict'}:
+            if error_code == 'TransactionCanceledException':
+                # A duplicate committed batch fails its guard condition.
+                # Throttling/conflict cancellations need no extra guard read:
+                # retrying the same conditional transaction remains safe.
+                if 'ConditionalCheckFailed' in codes:
+                    if _guard_complete(guard):
+                        return 0
+                    raise
+                if not codes or codes - {
+                    'None', 'TransactionConflict', 'ThrottlingError',
+                    'ProvisionedThroughputExceeded',
+                }:
+                    raise
+                throttled = bool(codes & {'ThrottlingError', 'ProvisionedThroughputExceeded'})
+            elif error_code in {
+                'ThrottlingException', 'ProvisionedThroughputExceededException',
+                'RequestLimitExceeded',
+            }:
+                throttled = True
+            else:
                 raise
             if attempt + 1 == TRANSACTION_MAX_ATTEMPTS:
                 raise
@@ -234,9 +246,12 @@ def _record_batch_completion(trigger, rows, source_digest, context=None):
                     and context.get_remaining_time_in_millis() < (delay + 2) * 1000):
                 raise TimeoutError('Insufficient time remaining to retry batch completion')
             print(json.dumps({
-                'event': 'reducer_transaction_conflict', 'jobId': trigger['jobId'],
+                'event': 'reducer_transaction_throttled' if throttled else 'reducer_transaction_conflict',
+                'jobId': trigger['jobId'],
                 'batchId': trigger['batchId'],
                 'attempt': attempt + 1, 'retryDelaySeconds': delay,
+                'errorCode': error_code,
+                'throttlingReasons': error.response.get('ThrottlingReasons', []),
                 'cancellationReasons': reasons,
             }))
             time.sleep(delay)

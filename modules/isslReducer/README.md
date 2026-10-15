@@ -38,9 +38,16 @@ new scores or progress are committed.
 
 The completion identity remains `<job-id>:<target-id>`. Conditional guards
 require an existing target without `ReducerTaskId` and an existing tracking
-item. Transaction conflicts use 16 attempts with exponential jitter starting
+item. Transaction conflicts and throughput throttling use 16 attempts with exponential jitter starting
 at 0.1 seconds and capped at 2 seconds per sleep. Retries stop early if the
 Lambda context has insufficient remaining time.
+Retryable cancellations include mixtures of `TransactionConflict`,
+`ThrottlingError` and `ProvisionedThroughputExceeded`. Top-level throttling
+exceptions also retry after SDK retries are exhausted. Conditional/validation
+failures do not retry unless the durable guard proves this batch committed.
+Throttling logs use `reducer_transaction_throttled` and include error/reason
+details. Cancellation retries do not add guard reads while the service is
+throttling; the conditional transaction still prevents duplicate completion.
 On transaction cancellation, a consistent completion-record read recognizes
 a duplicate committed batch. Other conditional failures remain errors. Results
 above 98 guides are rejected before writes; there is no recovery of old

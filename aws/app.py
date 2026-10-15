@@ -331,7 +331,7 @@ class CracklingStack(Stack):
         sqsIsslReducer = sqs_.Queue(self, "sqsIsslReducer",
             receive_message_wait_time=Duration.seconds(20),
             visibility_timeout=duration,
-            retention_period=Duration.minutes(30)
+            retention_period=Duration.minutes(45)
         )
         
         ### SQS queue for evaluating guide efficiency
@@ -551,7 +551,6 @@ class CracklingStack(Stack):
                 'BUCKET' : s3GenomeAccess.attr_alias,
                 'MAPPER_QUEUE': sqsIsslMapper.queue_url,
                 'EXTRACTOR_QUEUE': sqsIsslCandidateExtractor.queue_url,
-                'NUM_SHARDS': '5',
                 'MAX_EXTRACTORS': '50',
                 'EXTRACTOR_SAFE_BYTES': str(8 * 1024 ** 3),
                 'MAPPER_SAFE_BYTES': str(8 * 1024 ** 3),
@@ -699,7 +698,7 @@ class CracklingStack(Stack):
             "mapLdaIsslSqsReducer",
             event_source_arn=sqsIsslReducer.queue_arn,
             batch_size=10,
-            max_concurrency=45,
+            max_concurrency=10,
             report_batch_item_failures=True
         )
         ddbTargets.grant_read_write_data(lambdaIsslReducer)
