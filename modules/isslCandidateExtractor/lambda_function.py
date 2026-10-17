@@ -235,7 +235,10 @@ def _process(task):
             }))
             if count:
                 s3.upload_file(output_file, BUCKET, key,
-                               ExtraArgs={'ContentType': 'application/octet-stream'})
+                               ExtraArgs={
+                                   'ContentType': 'application/octet-stream',
+                                   'Tagging': 'crackling-cache=extracted-candidates',
+                               })
 
             records.append({'sliceId': bucket['sliceId'], 'bucketId': bucket['bucketId'],
                             'manifestKey': bucket['manifestKey'], 'key': key if count else None,

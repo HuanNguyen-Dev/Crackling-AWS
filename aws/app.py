@@ -81,9 +81,21 @@ class CracklingStack(Stack):
         cdk.CfnOutput(self, "Cloudfront_URL", value=cloudfront_url)
 
         ### Create an S3 bucket to store genome data
+        candidate_retention_context = self.node.try_get_context("candidateRetentionDays")
+        candidate_retention_days = int(
+            7 if candidate_retention_context is None else candidate_retention_context
+        )
+        if candidate_retention_days < 1:
+            raise ValueError("candidateRetentionDays must be a positive integer")
+
         s3Genome = s3_.Bucket(self, "genomeStorage", 
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
+            lifecycle_rules=[s3_.LifecycleRule(
+                id="ExpireExtractedCandidates",
+                tag_filters={"crackling-cache": "extracted-candidates"},
+                expiration=Duration.days(candidate_retention_days),
+            )],
             cors=[s3_.CorsRule(
                 allowed_methods=[
                     s3_.HttpMethods.GET,

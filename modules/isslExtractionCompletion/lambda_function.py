@@ -140,6 +140,7 @@ def _process(message):
             Key=bucket['manifestKey'],
             Body=json.dumps(manifest, separators=(',', ':')).encode(),
             ContentType='application/json',
+            Tagging='crackling-cache=extracted-candidates',
         )
 
     _send([
