@@ -1,11 +1,11 @@
 # Layer: `isslCandidateExtractor`
 
 This layer contains the precompiled Linux x86_64 candidate Extractor used by
-the Crackling AWS candidate-extraction pipeline. Each invocation hydrates one
-compressed ISSL bucket for one contiguous, half-open global off-target ID
-interval. The Extractor combines bucket IDs with signature bytes, compressed
-occurrence bytes, and the applicable overflow rows downloaded by the Lambda
-wrapper.
+the Crackling AWS candidate-extraction pipeline. Each native invocation hydrates
+a batch of compressed ISSL buckets for one shared, contiguous, half-open global
+off-target ID interval. The Extractor combines bucket IDs with signature bytes,
+compressed occurrence bytes, and the applicable overflow rows downloaded by the
+Lambda wrapper.
 
 The native source is maintained in this repository at
 [`native/isslCandidateExtractor/isslExtractCandidates.cpp`](../../native/isslCandidateExtractor/isslExtractCandidates.cpp).
@@ -69,15 +69,45 @@ uint32 occurrences
 
 The Lambda wrapper downloads only the signature and occurrence ranges for its
 ID partition. It binary-searches the sorted overflow table by global ID and
-downloads only rows in that partition. The native Extractor receives:
+downloads only rows in that partition. For `P = endId - startId`, the staged
+`signatures.bin` contains exactly `5 * P` bytes and `occurrences.bin` contains
+exactly `P` bytes. Both are headerless and ordered by global ID. `overflow.bin`
+contains only the partition's sorted 16-byte rows, one per sentinel occurrence;
+it is empty when no counts overflow. Zero occurrence counts are invalid.
+
+The wrapper stages every selected bucket, writes a plan, and invokes the native
+Extractor once with eight positional arguments:
 
 ```text
-extractor signatures.bin occurrences.bin overflow.bin bucket.bin \
-  elementCount startId endId idBits totalCount candidates.bin
+extractor signatures.bin occurrences.bin overflow.bin buckets.tsv \
+  startId endId idBits totalCount
 ```
 
-It validates and resolves sentinel occurrences while it writes hydrated
-candidates. Mapper never receives the raw occurrence bytes or overflow table.
+All numeric CLI arguments are unsigned decimal integers, with
+`0 <= startId <= endId <= totalCount <= 2^40`. `totalCount` is the full
+catalogue's off-target count. `idBits` must be 32 for `totalCount <= 2^32` and
+64 otherwise.
+
+`buckets.tsv` is a nonempty, headerless, LF-delimited file. Each row contains
+exactly three tab-separated fields:
+
+```text
+bucketPath<TAB>elementCount<TAB>outputPath
+```
+
+`<TAB>` denotes a literal tab; paths must not contain tabs or newlines.
+`elementCount` is the complete bucket's decoded entry count, not the number of
+IDs in this partition. Each bucket is a headerless unsigned LEB128 stream:
+the first value is an absolute global ID and each subsequent value is a
+positive delta. The decoded IDs are strictly increasing and below `totalCount`.
+
+The Extractor maps the shared catalogue files once and processes plan rows in
+order, mapping one bucket at a time. It creates or truncates each row's output
+file, filters IDs to `[startId, endId)`, zero-extends each 5-byte signature to
+`uint64`, and resolves sentinel occurrences. It stops decoding a bucket at the
+first ID at or above `endId`; the unvisited suffix is not validated. A fully
+scanned bucket must match both its declared entry count and byte length.
+Mapper never receives the raw occurrence bytes or overflow table.
 
 Hydrated output is headerless, little-endian, and packed:
 
@@ -86,23 +116,34 @@ Hydrated output is headerless, little-endian, and packed:
 | 32-bit | `<QII>`: signature, ID, occurrences | 16 |
 | 64-bit | `<QQI>`: signature, ID, occurrences | 20 |
 
-The candidate Mapper consumes only these hydrated records during off-target
-scoring.
+Each matching bucket ID produces one record in bucket order; occurrences
+remain a field and never expand into repeated records. A bucket with no matching
+IDs produces an empty file. Success returns exit status 0 and writes
+`candidateRecords=<total across all outputs>` to stdout. Failures return status
+1 with diagnostics on stderr; partial outputs may remain and the wrapper rejects
+the invocation before uploading them.
+
+The wrapper accepts schema-3 extraction tasks and writes a schema-2 completion
+marker with each bucket's partition range, ID width, record width, and count.
+Empty fragments have `key: null`. Extraction Completion verifies contiguous
+partition coverage and the complete bucket count before writing schema-2
+hydrated manifests. The Mapper wrapper validates manifest widths and downloaded
+byte counts, then combines these hydrated records for off-target scoring.
 
 ## Working-set and output-size bound
 
-The Lambda downloads a catalogue partition, maps the current compressed bucket,
-and truncates `candidates.bin` before processing each bucket. A bucket is a
-compressed LEB128 global-ID list. Every bucket entry whose ID is in the
-Extractor's half-open interval can produce at most one hydrated record;
-occurrences remain a field and never expand into repeated records.
+The Lambda downloads one catalogue partition and stages all selected compressed
+buckets before starting the native process. Each bucket has a distinct
+`bucket-N.bin` input and `candidates-N.bin` output. Although the native process
+maps buckets sequentially, all staged inputs and completed outputs remain on
+disk until the task's temporary directory is cleaned up.
 
 For capacity planning, let:
 
 - `P = ceil(offtargetsCount / extractorCount)`, the largest ID partition;
 - `K`, the complete overflow-row count;
-- `B`, the current compressed bucket size in bytes;
-- `E`, the bucket's decoded entry count; and
+- `B_i`, compressed bucket `i`'s size in bytes;
+- `E_i`, bucket `i`'s decoded entry count; and
 - `R`, the hydrated record width (16 or 20 bytes).
 
 The raw catalogue download is bounded by:
@@ -111,26 +152,34 @@ The raw catalogue download is bounded by:
 6 * P + 16 * min(K, P)
 ```
 
-For one bucket, the conservative working-set estimate is:
+For all selected uncached buckets, the conservative staged-file estimate is:
 
 ```text
-6 * P + 16 * min(K, P) + B + min(E, P) * R + safetyMargin
+6 * P + 16 * min(K, P) + sum_i(B_i + min(E_i, P) * R)
 ```
 
-The selected bucket and output paths are reused sequentially. The Lambda logs
-actual catalogue, bucket, hydrated-output, and combined local byte counts so
-the estimate can be compared with production behaviour.
+The Dispatcher initially chooses the partition count using the largest
+individual bucket footprint, then checks the cumulative footprint of the
+selected uncached buckets. Guide grouping also bounds cumulative bucket work.
+The Lambda logs actual catalogue, bucket, hydrated-output, and combined local
+file byte counts so the estimate can be compared with production behaviour.
 
 The dynamic allocator therefore distinguishes two cases:
 
-- `RETRY_WITH_MORE_EXTRACTORS`: the bucket fits, but the catalogue partition
-  or estimated output requires a larger `N`.
-- `BUCKET_EXCEEDS_LAMBDA_LIMIT`: the compressed bucket and its maximum hydrated
-  output already exceed the configured safe working limit, so increasing the
-  partition count cannot make the task safe.
+- `RETRY_WITH_MORE_EXTRACTORS`: the staged bucket footprint alone is below the
+  configured safe working limit, but adding the catalogue partition reaches or
+  exceeds that limit.
+- `TOTAL_BUCKET_EXCEEDS_LAMBDA_LIMIT`: the sum of compressed bucket bytes and
+  estimated partition outputs alone reaches the configured safe working limit
+  at the selected partition count. The Dispatcher rejects this task; this does
+  not prove that every larger partition count would also fail.
 
 The Dispatcher can calculate this before publishing extraction work because
 `shards.json` contains `offtargetsCount`, the overflow count, and every
 bucket's byte boundaries and decoded-entry counts. This model primarily
-protects Lambda `/tmp`; memory-map residency and native process overhead still
-require a safety margin against the Lambda memory limit.
+protects Lambda `/tmp`. The configured safe limit must leave headroom for the
+plan and other temporary files. Each merged S3 range read is bounded by
+`MAX_MERGE_RANGE_BYTES` (default 16 MiB); the default merge gap is 256 KiB.
+Larger buckets stream directly to disk. Memory-map residency, range
+buffers, and native process overhead require separate memory headroom; the
+staged-file estimate is not a peak-RAM bound.

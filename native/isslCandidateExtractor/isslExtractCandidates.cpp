@@ -1,15 +1,45 @@
 /*
-Hydrates one raw ISSL bucket for one contiguous global off-target ID interval.
+Hydrates a batch of compressed ISSL buckets for one shared, half-open global
+off-target ID interval [startId, endId). The Lambda wrapper stages the inputs
+and invokes this process once per partition; buckets are processed in plan order.
 
-Input contracts (little-endian on the Lambda x86_64 build):
-  catalogue-part.bin: headerless uint64_t signatures for [startId, endId)
-  bucket.bin:         headerless uint64_t entries [occurrences:32][globalId:32]
+CLI (eight positional arguments):
+  extractor signatures.bin occurrences.bin overflow.bin buckets.tsv
+    startId endId idBits totalCount
+
+Input contracts (little-endian):
+  signatures.bin:  headerless 5-byte signatures for [startId, endId), ID order
+  occurrences.bin: one byte per partition ID; 1..254 is the full count,
+                   255 selects a full uint32 count from overflow.bin; 0 is invalid
+  overflow.bin:    partition-only rows, sorted by global ID, packed as <QI4x>
+                   (uint64 globalId, uint32 occurrences >= 255, 4 padding bytes)
+  buckets.tsv:     nonempty, headerless LF-delimited plan; each row has exactly
+                   bucketPath<TAB>elementCount<TAB>outputPath
+                   elementCount is the complete bucket's decoded entry count
+  Each bucket is a headerless unsigned LEB128 stream: first value is an absolute
+  global ID; subsequent values are positive deltas, giving strictly increasing
+  IDs below totalCount. Decoding stops at the first ID >= endId; an unvisited
+  suffix is not validated. If fully scanned, count and byte length must match.
+  All numeric CLI arguments are unsigned decimal integers, with
+  0 <= startId <= endId <= totalCount <= 2^40. idBits must be 32 when
+  totalCount <= 2^32 and 64 otherwise.
 
 Output contract:
-  candidates.bin: headerless HydratedCandidate records compatible with <QII
+  Each plan row truncates/creates its own headerless, packed little-endian file.
+  One record is written per bucket ID in [startId, endId), in bucket order:
+    idBits == 32: <QII> (uint64 signature, uint32 globalId, uint32 occurrences)
+    idBits == 64: <QQI> (uint64 signature, uint64 globalId, uint32 occurrences)
+  Records occupy 16 or 20 bytes. The 5-byte signature is zero-extended to uint64;
+  occurrences are resolved counts, never expanded into repeated records.
+  A bucket with no matching IDs produces an empty output file.
+  Success returns 0 and prints candidateRecords=<sum across all outputs>.
+  Failures return 1 with diagnostics on stderr; partial outputs may remain.
 
-Build:
-  g++ -o extractor isslExtractCandidates.cpp -O3 -std=c++11
+Build from the Crackling-AWS repository root in the Lambda-compatible container:
+  g++ -o layers/isslCandidateExtractor/extractor \
+    native/isslCandidateExtractor/isslExtractCandidates.cpp \
+    -O3 -std=c++11 -static-libgcc -static-libstdc++
+  See layers/isslCandidateExtractor/README.md for the Docker build command.
 */
 
 #include <cerrno>
@@ -194,7 +224,7 @@ int main(int argc, char **argv) {
 
     if (!signatureFile || !occurrenceFile || !overflowFile) {
         std::fprintf(stderr, "Unable to open extractor input file\n");
-        // Close whichever files were opened.
+        // Process exit releases any input files that were opened successfully.
         return 1;
     }
 
@@ -214,11 +244,10 @@ int main(int argc, char **argv) {
         std::fclose(signatureFile);
         std::fclose(occurrenceFile);
         std::fclose(overflowFile);
-        // Close files, then return 1.
         return 1;
     }
 
-    // Map the four files as raw bytes.
+    // Keep the three catalogue partitions mapped across all bucket plan rows.
     const uint8_t *signatures = nullptr;
     const uint8_t *occurrences = nullptr;
     const uint8_t *overflow = nullptr;
