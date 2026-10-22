@@ -7,9 +7,12 @@ interval. The Extractor combines bucket IDs with signature bytes, compressed
 occurrence bytes, and the applicable overflow rows downloaded by the Lambda
 wrapper.
 
-The native source is `isslExtractCandidates.cpp` in the Crackling scoring
-source tree. Build it in the Lambda-compatible Python 3.10 Amazon Linux 2
-container from the directory containing that source:
+The native source is maintained in this repository at
+[`native/isslCandidateExtractor/isslExtractCandidates.cpp`](../../native/isslCandidateExtractor/isslExtractCandidates.cpp).
+The Python Lambda wrapper is in `modules/isslCandidateExtractor/`.
+Build the source in the Lambda-compatible Python 3.10 Amazon Linux 2
+container. Run the following from the Crackling-AWS repository root in a
+Linux shell (for example, WSL) with Docker available:
 
 ```bash
   sudo docker run --rm \
@@ -20,22 +23,22 @@ container from the directory containing that source:
       public.ecr.aws/lambda/python:3.10 \
       -lc '
         yum install -y gcc-c++ &&
-        g++ -o extractor \
-          isslExtractCandidates.cpp \
+        g++ -o layers/isslCandidateExtractor/extractor \
+          native/isslCandidateExtractor/isslExtractCandidates.cpp \
           -O3 \
           -std=c++11 \
           -static-libgcc \
           -static-libstdc++ &&
-        chmod 755 extractor
+        chmod 755 layers/isslCandidateExtractor/extractor &&
+        ldd layers/isslCandidateExtractor/extractor
       '
 ```
 
-Copy the resulting binary to `layers/isslCandidateExtractor/extractor` in the
-AWS repository. Verify its dynamic dependencies in the same Lambda container:
-
-```bash
-ldd /extractor
-```
+This command replaces `layers/isslCandidateExtractor/extractor` with the rebuilt
+binary and checks its dynamic dependencies inside the same Lambda container.
+The layer packages that binary at `/opt/extractor`; the Lambda wrapper copies
+it to `/tmp/extractor` before execution. Rebuild the binary after changing the
+C++ source and before packaging the layer.
 
 The current Extractor resolves only Amazon Linux core libraries (`libm` and
 `libc`), so it does not require additional shared libraries in `layers/lib`.
